@@ -15,8 +15,9 @@
     "test:watch": "vitest",
     "train:color": "node scripts/train-color.mjs",
     "build:test": "node scripts/build.mjs --test",
-    "test:e2e": "node scripts/build.mjs --test && node scripts/gen-fixtures.mjs && node tests/e2e/run-e2e.mjs",
-    "test:all": "npm run test && npm run test:e2e"
+    "test:e2e": "node scripts/build.mjs --test && node scripts/ensure-fixtures.mjs && node tests/e2e/run-e2e.mjs",
+    "test:all": "npm run test && npm run test:e2e",
+    "pretest": "node scripts/ensure-fixtures.mjs"
   },
   "devDependencies": {
     "@resvg/resvg-js": "^2.6.2",

@@ -15,14 +15,17 @@
  */
 
 import type { RGBAImage, BoardMatrix, CellClassification, RecognitionResult, PieceCode, PieceType } from './types';
-import { colorDist, luminance, median, medianColor } from './image';
-import { erodeMask, fillHoles, largestComponent, normalizeSilhouette, silhouetteSimilarity, type NormalizedSilhouette } from './silhouette';
+import { colorDist, downscale, luminance, median, medianColor } from './image';
+import { erodeMask, fillHoles, largestComponent, morphOpenSupport, normalizeSilhouette, silhouetteSimilarity, type NormalizedSilhouette } from './silhouette';
 import { loadTemplates, type PieceTemplate } from './templates';
 import colorModel from './colorModel.gen.json';
 
 const REL_HEIGHT_PENALTY = 0.5;
 const MIN_OCCUPANCY_FILL = 0.045; // fraction of cell area that must be foreground
+const MIN_BBOX_DENSITY = 0.16;
+const CANONICAL_CELL = 64; // large boards are downsampled to this cell size // mask mass / bbox area: rejects thin texture streaks
 const MIN_TYPE_SCORE = 0.45; // below this the cell is flagged low-confidence
+const MIN_PIECE_SCORE = 0.4; // below this a foreground blob is not a piece
 
 /** Normalized luminance/texture statistics of a piece, input to the color
  *  model. All values are scale-invariant (fractions or 0..1 luminances). */
@@ -151,6 +154,63 @@ function buildMask(
   return { mask, mass };
 }
 
+/** Mask built against a per-column background (median color of each column's
+ *  top/bottom bands). Handles vertically streaked square textures. */
+function buildColumnMask(
+  img: RGBAImage,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  refBg: BgEstimate,
+): { mask: Float32Array; mass: number } | null {
+  const d = img.data;
+  const w = x1 - x0, h = y1 - y0;
+  const bandTop = Math.max(2, Math.round(h * 0.16));
+  const bandBot = Math.max(2, Math.round(h * 0.12));
+  if (bandTop + bandBot >= h) return null;
+  const bgR = new Float32Array(w);
+  const bgG = new Float32Array(w);
+  const bgB = new Float32Array(w);
+  const rs: number[] = [], gs: number[] = [], bs: number[] = [];
+  const devs: number[] = [];
+  for (let x = 0; x < w; x++) {
+    rs.length = 0; gs.length = 0; bs.length = 0;
+    for (let y = 0; y < h; y++) {
+      if (y >= bandTop && y < h - bandBot) continue;
+      const i = ((y0 + y) * img.width + x0 + x) * 4;
+      rs.push(d[i]); gs.push(d[i + 1]); bs.push(d[i + 2]);
+    }
+    bgR[x] = median(rs); bgG[x] = median(gs); bgB[x] = median(bs);
+    // A column whose estimated background strays far from the cell's overall
+    // background has been absorbed by a piece (rooks are column-constant!) or
+    // an extreme artifact: fall back to the constant background there.
+    if (colorDist(bgR[x], bgG[x], bgB[x], ...refBg.color) > 45) {
+      bgR[x] = refBg.color[0]; bgG[x] = refBg.color[1]; bgB[x] = refBg.color[2];
+    }
+    // Column noise: mean distance of band pixels to their column median.
+    let dev = 0;
+    for (let k = 0; k < rs.length; k++) dev += colorDist(rs[k], gs[k], bs[k], bgR[x], bgG[x], bgB[x]);
+    devs.push(dev / rs.length);
+  }
+  const noise = median(devs);
+  const t0 = Math.min(30, Math.max(10, noise * 3.5));
+  const span = 1.5 * t0;
+  const mask = new Float32Array(w * h);
+  let mass = 0;
+  for (let y = 0; y < h; y++) {
+    let i = ((y0 + y) * img.width + x0) * 4;
+    for (let x = 0; x < w; x++, i += 4) {
+      const dist = colorDist(d[i], d[i + 1], d[i + 2], bgR[x], bgG[x], bgB[x]);
+      const v = (dist - t0) / span;
+      const clamped = v <= 0 ? 0 : v >= 1 ? 1 : v;
+      mask[y * w + x] = clamped;
+      mass += clamped;
+    }
+  }
+  return { mask, mass };
+}
+
 function analyzeCell(
   img: RGBAImage,
   ox0: number,
@@ -173,9 +233,37 @@ function analyzeCell(
   let { mask, mass } = buildMask(img, x0, y0, x1, y1, cornerBg);
   if (globalBg && colorDist(...globalBg.color, ...cornerBg.color) > 12) {
     const alt = buildMask(img, x0, y0, x1, y1, globalBg);
-    if (alt.mass < mass) mask = alt.mask;
+    if (alt.mass < mass) {
+      mask = alt.mask;
+      mass = alt.mass;
+    }
   }
-  const filled = fillHoles(largestComponent(mask, w, h), w, h);
+  // Third candidate: per-column background, estimated from the top/bottom
+  // bands of each column (rarely covered by the piece). Wood-grain streaks
+  // are vertical and column-constant, so each streak becomes its own
+  // background and vanishes from the mask; corner coordinate labels are
+  // similarly absorbed. The lowest-mass mask wins, as usual: the correct
+  // background model explains more of the cell as background.
+  // Only for visibly textured squares: on flat themes the constant models
+  // are already exact and the column model can only nibble at pieces.
+  if ((globalBg?.noise ?? cornerBg.noise) > 3.5) {
+    const chosenBg =
+      globalBg && colorDist(...globalBg.color, ...cornerBg.color) > 12 ? cornerBg : (globalBg ?? cornerBg);
+    const colMask = buildColumnMask(img, x0, y0, x1, y1, chosenBg);
+    if (colMask && colMask.mass < mass) mask = colMask.mask;
+  }
+  // Fill enclosed holes FIRST (outline-drawn pieces become solid bodies),
+  // then, on large cells, apply a morphological opening: solid pieces
+  // survive, while thin texture streaks (wood grain) and the bridges they
+  // form between pieces and coordinate labels get cut. Finally keep the
+  // dominant component(s) and re-fill.
+  const cellMin = Math.min(w, h);
+  const prefilled = fillHoles(mask, w, h);
+  const cleaned =
+    cellMin >= 45
+      ? morphOpenSupport(prefilled, w, h, Math.max(1, Math.round(cellMin * 0.018)))
+      : prefilled;
+  const filled = fillHoles(largestComponent(cleaned, w, h), w, h);
 
   // --- 3. Fill statistics for the color model -------------------------------
   // Luminance map over the fill (filled > 0.6).
@@ -283,7 +371,10 @@ function analyzeCell(
     silhouette !== null &&
     silhouette.fill >= MIN_OCCUPANCY_FILL &&
     silhouette.relHeight >= 0.28 &&
-    silhouette.relWidth >= 0.15;
+    silhouette.relWidth >= 0.15 &&
+    // Real pieces are compact; wood-grain streaks that clear the mass
+    // threshold are thin and sparse within their bounding box.
+    silhouette.fill / (silhouette.relHeight * silhouette.relWidth) >= MIN_BBOX_DENSITY;
 
   return {
     occupied,
@@ -337,6 +428,7 @@ export function debugAnalyzeCell(boardImg: RGBAImage, r: number, c: number): Cel
   match?: { piece: PieceType; score: number; margin: number };
   perTemplate?: { id: string; score: number }[];
 } {
+  if (boardImg.width > 8 * CANONICAL_CELL * 1.25) boardImg = downscale(boardImg, 8 * CANONICAL_CELL).img;
   const cw = boardImg.width / 8;
   const ch = boardImg.height / 8;
   const globals = globalParityColors(boardImg);
@@ -384,7 +476,15 @@ function globalParityColors(boardImg: RGBAImage): [BgEstimate, BgEstimate] {
 
 /** Analyze all 64 cells of a board image (also used by the offline color
  *  model trainer). */
-export function analyzeBoard(boardImg: RGBAImage): CellAnalysis[][] {
+export function analyzeBoard(rawBoardImg: RGBAImage): CellAnalysis[][] {
+  // Scale normalization: very large boards are downsampled to a canonical
+  // cell size. Box-averaging suppresses high-frequency square texture (wood
+  // grain) that otherwise bridges coordinate labels to pieces and creates
+  // phantom foreground, and it keeps processing costs flat.
+  const boardImg =
+    rawBoardImg.width > 8 * CANONICAL_CELL * 1.25
+      ? downscale(rawBoardImg, 8 * CANONICAL_CELL).img
+      : rawBoardImg;
   const cw = boardImg.width / 8;
   const ch = boardImg.height / 8;
   const globals = globalParityColors(boardImg);
@@ -424,9 +524,26 @@ export function classifyBoard(boardImg: RGBAImage, templates?: PieceTemplate[]):
       }
       const isWhite = a.features ? whitenessScore(a.features) >= 0 : a.medianLum >= 128;
       const { piece, score, margin, typeScores } = matchType(a.silhouette, tpls);
+      if (score < MIN_PIECE_SCORE) {
+        // Foreground blob that matches no piece silhouette at all: texture
+        // artifact (real pieces score well above this even in unseen styles).
+        boardRow.push(null);
+        cellRow.push({ piece: null, score, margin });
+        continue;
+      }
       const code = (isWhite ? piece : piece.toLowerCase()) as PieceCode;
       boardRow.push(code);
-      cellRow.push({ piece: code, score, margin, typeScores });
+      cellRow.push({
+        piece: code,
+        score,
+        margin,
+        typeScores,
+        silhouette: {
+          grid: a.silhouette.grid,
+          relHeight: a.silhouette.relHeight,
+          relWidth: a.silhouette.relWidth,
+        },
+      });
       scoreSum += Math.max(0, Math.min(1, score));
       occupiedCount++;
     }
@@ -463,9 +580,96 @@ export function classifyBoard(boardImg: RGBAImage, templates?: PieceTemplate[]):
             altPiece = p as PieceType;
           }
         }
+        // A misread king is nearly always a queen (the confusable crown pair);
+        // prefer Q unless another type wins clearly.
+        if (altPiece !== 'Q' && ts.Q !== undefined && ts.Q >= altScore - 0.03) altPiece = 'Q';
         const code = (kingCode === 'K' ? altPiece : altPiece.toLowerCase()) as PieceCode;
         board[claim.r][claim.c] = code;
         cells[claim.r][claim.c].piece = code;
+      }
+    }
+  }
+
+  // --- Coherence pass: a color with no king reclaims its best K candidate ---
+  // (symmetric to the multi-king demotion: a kingless side is invalid anyway,
+  // and the K/Q crown pair is the usual culprit).
+  for (const white of [true, false]) {
+    const kingCode = (white ? 'K' : 'k') as PieceCode;
+    let hasKing = false;
+    for (const row of board) for (const q of row) if (q === kingCode) hasKing = true;
+    if (hasKing) continue;
+    let best: { r: number; c: number; deficit: number } | null = null;
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = board[r][c];
+        if (!p || (p === p.toUpperCase()) !== white) continue;
+        if (p.toUpperCase() !== 'Q') continue;
+        const ts = cells[r][c].typeScores ?? {};
+        if (ts.K === undefined || ts.Q === undefined) continue;
+        const deficit = ts.Q - ts.K;
+        if (deficit <= 0.05 && (!best || deficit < best.deficit)) best = { r, c, deficit };
+      }
+    }
+    if (best) {
+      board[best.r][best.c] = kingCode;
+      cells[best.r][best.c].piece = kingCode;
+    }
+  }
+
+  // --- Coherence pass: implausible piece counts -----------------------------
+  // Three-plus bishops/knights/rooks of one color essentially never happen
+  // (underpromotions are vanishingly rare); when texture artifacts inflate a
+  // count, demote the weakest-margin claims to their runner-up type as long
+  // as that type scored nearly as well.
+  for (const white of [true, false]) {
+    for (const type of ['B', 'N', 'R'] as PieceType[]) {
+      const code = (white ? type : type.toLowerCase()) as PieceCode;
+      const claims: { r: number; c: number; margin: number }[] = [];
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          if (board[r][c] !== code) continue;
+          const ts = cells[r][c].typeScores ?? {};
+          let bestOther = -Infinity;
+          for (const [p, s] of Object.entries(ts)) {
+            if (p !== type && s !== undefined && s > bestOther) bestOther = s;
+          }
+          claims.push({ r, c, margin: (ts[type] ?? 0) - bestOther });
+        }
+      }
+      if (claims.length <= 2) continue;
+      claims.sort((a, b) => b.margin - a.margin);
+      const countOf = (p: PieceType): number => {
+        const c2 = (white ? p : p.toLowerCase()) as PieceCode;
+        let n = 0;
+        for (const row of board) for (const q of row) if (q === c2) n++;
+        return n;
+      };
+      for (const claim of claims.slice(2)) {
+        if (claim.margin > 0.08) continue; // confident claim: leave it alone
+        const ts = cells[claim.r][claim.c].typeScores ?? {};
+        // Candidate replacement types: not the current type, not a king, and
+        // not a type that is itself already at its plausible maximum
+        // (otherwise two saturated types just trade the claim back and forth).
+        let altPiece: PieceType | null = null;
+        let altScore = -Infinity;
+        for (const [p, s] of Object.entries(ts)) {
+          if (p === type || p === 'K' || s === undefined) continue;
+          if ((p === 'B' || p === 'N' || p === 'R') && countOf(p as PieceType) >= 2) continue;
+          if (p === 'P' && countOf('P') >= 8) continue;
+          if (s > altScore) {
+            altScore = s;
+            altPiece = p as PieceType;
+          }
+        }
+        if (!altPiece) continue;
+        // Misread empty-square artifacts and small pieces are most often
+        // pawns; prefer P over a near-tied alternative.
+        if (altPiece !== 'P' && ts.P !== undefined && countOf('P') < 8 && ts.P >= altScore - 0.025) {
+          altPiece = 'P';
+        }
+        const newCode = (white ? altPiece : altPiece.toLowerCase()) as PieceCode;
+        board[claim.r][claim.c] = newCode;
+        cells[claim.r][claim.c].piece = newCode;
       }
     }
   }

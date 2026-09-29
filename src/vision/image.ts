@@ -48,6 +48,30 @@ export function downscale(img: RGBAImage, maxDim: number): { img: RGBAImage; sca
   return { img: out, scale: w / img.width };
 }
 
+/** 3x3 box blur (RGB). Suppresses high-frequency square texture (wood grain)
+ *  before mask building while barely affecting piece shapes. */
+export function boxBlur3(img: RGBAImage): RGBAImage {
+  const { width: w, height: h, data: src } = img;
+  const out = makeImage(w, h);
+  const d = out.data;
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - 1), y1 = Math.min(h - 1, y + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - 1), x1 = Math.min(w - 1, x + 1);
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let yy = y0; yy <= y1; yy++) {
+        for (let xx = x0; xx <= x1; xx++) {
+          const i = (yy * w + xx) * 4;
+          r += src[i]; g += src[i + 1]; b += src[i + 2]; n++;
+        }
+      }
+      const o = (y * w + x) * 4;
+      d[o] = r / n; d[o + 1] = g / n; d[o + 2] = b / n; d[o + 3] = 255;
+    }
+  }
+  return out;
+}
+
 export function luminance(r: number, g: number, b: number): number {
   return 0.299 * r + 0.587 * g + 0.114 * b;
 }

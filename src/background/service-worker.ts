@@ -97,6 +97,19 @@ chrome.runtime.onMessage.addListener(
         return true;
       }
 
+      case 'vision-recognize': {
+        ensureOffscreen()
+          .then(() =>
+            chrome.runtime.sendMessage({
+              type: 'offscreen-vision-recognize',
+              dataUrl: message.dataUrl,
+            } satisfies BackgroundToOffscreen),
+          )
+          .then((result) => sendResponse(result))
+          .catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
+        return true;
+      }
+
       case 'stop-analysis': {
         ensureOffscreen()
           .then(() => chrome.runtime.sendMessage({ type: 'engine-stop' } satisfies BackgroundToOffscreen))

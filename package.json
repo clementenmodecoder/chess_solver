@@ -31,7 +31,9 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
+    "@scoriiu/fenshot": "^0.1.4",
     "chess.js": "^1.0.0",
+    "onnxruntime-web": "^1.30.0",
     "stockfish": "^19.0.0"
   }
 }

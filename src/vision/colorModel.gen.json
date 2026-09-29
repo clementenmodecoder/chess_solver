@@ -1,13 +1,13 @@
 {
   "weights": {
-    "med": 4.80723,
-    "q20": 0.54268,
-    "q80": 4.69232,
-    "fracBright": 8.31911,
-    "fracDark": -5.23726,
-    "outlineDark": 1.03044,
-    "brightPatch": 3.45615,
-    "texture": 2.22811
+    "med": 4.77611,
+    "q20": 0.53264,
+    "q80": 4.65882,
+    "fracBright": 8.30402,
+    "fracDark": -5.22566,
+    "outlineDark": 0.97641,
+    "brightPatch": 3.48848,
+    "texture": 2.22146
   },
-  "bias": -7.68414
+  "bias": -7.6672
 }

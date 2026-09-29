@@ -142,13 +142,29 @@ try {
     check(/^[+-]?\d|^-?M/.test(dbg.scoreText), `score displayed (${dbg.scoreText})`);
     check(!!dbg.bestMove, `best move displayed (${dbg.bestMove})`);
     check(await page.evaluate(() => !!document.getElementById('chess-lens-host')), 'overlay mounted');
+    check(dbg.recognizer === 'cnn', `CNN recognizer used (${dbg.recognizer})`);
+    await page.close();
+  }
+
+  // ---- Scenario 1b: textured wood board with coordinate glyphs ---------------
+  {
+    const page = await context.newPage();
+    await page.goto(`${base}/board?img=special-wood-coords-large.png&size=700`);
+    await page.bringToFront();
+    await inject(page);
+    await waitDebug(page, (dbg) => dbg?.fen != null, 30000);
+    const dbg = await readDebug(page);
+    check(
+      dbg.fen.startsWith('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR'),
+      `wood-textured board recognized (got: ${dbg.fen})`,
+    );
     await page.close();
   }
 
   // ---- Scenario 2: flipped middlegame, orientation + position ----------------
   {
     const page = await context.newPage();
-    await page.goto(`${base}/board?img=merida-middlegame-blue-600-flipped.png&size=600`);
+    await page.goto(`${base}/board?img=merida-middlegame-green-600-flipped.png&size=600`);
     await page.bringToFront();
     await inject(page);
     await waitDebug(page, (dbg) => dbg?.fen != null, 30000);

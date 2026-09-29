@@ -2,8 +2,9 @@
  *  speaks UCI with it. Engine output is parsed here and forwarded to the
  *  service worker as compact EngineUpdate messages. */
 
-import type { BackgroundToOffscreen, EngineOptions, EngineUpdate, OffscreenToBackground } from '../messages';
+import type { BackgroundToOffscreen, EngineOptions, EngineUpdate, OffscreenToBackground, VisionResult } from '../messages';
 import { parseBestMove, parseInfoLine, type UciInfoLine } from '../engine/uci';
+import { createRecognizer, type Recognizer } from '@scoriiu/fenshot';
 
 const ENGINE_URL = 'engine/stockfish-19-lite-single.js';
 
@@ -122,14 +123,59 @@ async function analyze(fen: string, options: EngineOptions, requestId: number): 
   send(parts.length ? `go ${parts.join(' ')}` : 'go movetime 5000');
 }
 
-chrome.runtime.onMessage.addListener((message: BackgroundToOffscreen) => {
-  if (message.type === 'engine-analyze') {
-    analyze(message.fen, message.options, message.requestId).catch((err) => {
-      active = { requestId: message.requestId, sideToMove: 'w', lines: new Map(), lastSent: 0, timer: null };
-      postUpdate(true, undefined, String(err?.message ?? err));
-      active = null;
+// --- CNN board recognition (fenshot + onnxruntime-web) -----------------------
+
+let recognizer: Recognizer | null = null;
+
+function getRecognizer(): Recognizer {
+  if (!recognizer) {
+    recognizer = createRecognizer({
+      modelUrl: chrome.runtime.getURL('vision/chess-tiles-v2.onnx'),
+      wasmPaths: {
+        mjs: chrome.runtime.getURL('vision/ort-wasm-simd-threaded.mjs'),
+        wasm: chrome.runtime.getURL('vision/ort-wasm-simd-threaded.wasm'),
+      },
     });
-  } else if (message.type === 'engine-stop') {
-    send('stop');
+    recognizer.warmUp();
   }
-});
+  return recognizer;
+}
+
+async function recognizeBoard(dataUrl: string): Promise<VisionResult> {
+  try {
+    const blob = await (await fetch(dataUrl)).blob();
+    const result = await getRecognizer().recognize(blob);
+    if (!result) return { ok: true, reliable: false };
+    return {
+      ok: true,
+      placement: result.placement,
+      minConfidence: result.minConfidence,
+      meanConfidence: result.meanConfidence,
+      reliable: result.reliable,
+      corners: result.corners,
+    };
+  } catch (err) {
+    return { ok: false, error: String((err as Error)?.message ?? err) };
+  }
+}
+
+chrome.runtime.onMessage.addListener(
+  (message: BackgroundToOffscreen, _sender, sendResponse: (r: VisionResult) => void) => {
+    if (message.type === 'engine-analyze') {
+      analyze(message.fen, message.options, message.requestId).catch((err) => {
+        active = { requestId: message.requestId, sideToMove: 'w', lines: new Map(), lastSent: 0, timer: null };
+        postUpdate(true, undefined, String(err?.message ?? err));
+        active = null;
+      });
+    } else if (message.type === 'engine-stop') {
+      send('stop');
+    } else if (message.type === 'offscreen-vision-recognize') {
+      recognizeBoard(message.dataUrl).then(sendResponse);
+      return true;
+    }
+  },
+);
+
+// Warm the recognizer as soon as the offscreen document exists: the first
+// scan is usually requested within a second of creation.
+getRecognizer();

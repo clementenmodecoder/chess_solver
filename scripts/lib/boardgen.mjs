@@ -11,8 +11,10 @@ export const THEMES = {
   green: { light: [238, 238, 210], dark: [118, 150, 86] },
   blue: { light: [222, 227, 230], dark: [140, 162, 173] },
   gray: { light: [216, 216, 216], dark: [124, 124, 124] },
-  // Low-ish contrast wooden-like theme.
+  // Low-ish contrast wooden-like theme (flat).
   walnut: { light: [192, 166, 132], dark: [131, 100, 74] },
+  // Textured wood with visible vertical grain (chess.com-like).
+  wood: { light: [222, 184, 135], dark: [154, 110, 74], grain: 14 },
 };
 
 export const POSITIONS = {
@@ -63,6 +65,61 @@ export function makeImage(width, height, fill = [255, 255, 255]) {
   return { data, width, height };
 }
 
+/** Vertical wood-grain texture: smooth per-column streaks plus fine noise. */
+export function fillGrainRect(img, x0, y0, w, h, color, amplitude, rand) {
+  // Column offsets: sum of two sines with random phases + random walk.
+  const phase1 = rand() * Math.PI * 2;
+  const phase2 = rand() * Math.PI * 2;
+  const f1 = 0.09 + rand() * 0.08;
+  const f2 = 0.3 + rand() * 0.25;
+  let walk = 0;
+  for (let x = Math.max(0, x0); x < Math.min(img.width, x0 + w); x++) {
+    walk += (rand() - 0.5) * 1.2;
+    walk *= 0.92;
+    const streak =
+      Math.sin(x * f1 + phase1) * 0.6 + Math.sin(x * f2 + phase2) * 0.4 + walk * 0.3;
+    for (let y = Math.max(0, y0); y < Math.min(img.height, y0 + h); y++) {
+      const d = streak * amplitude + (rand() - 0.5) * amplitude * 0.5;
+      const i = (y * img.width + x) * 4;
+      img.data[i] = Math.max(0, Math.min(255, color[0] + d));
+      img.data[i + 1] = Math.max(0, Math.min(255, color[1] + d * 0.9));
+      img.data[i + 2] = Math.max(0, Math.min(255, color[2] + d * 0.75));
+    }
+  }
+}
+
+/** 3x5 bitmap glyphs for board coordinates. */
+const GLYPHS = {
+  1: ['010', '110', '010', '010', '111'],
+  2: ['110', '001', '010', '100', '111'],
+  3: ['110', '001', '010', '001', '110'],
+  4: ['101', '101', '111', '001', '001'],
+  5: ['111', '100', '110', '001', '110'],
+  6: ['011', '100', '110', '101', '010'],
+  7: ['111', '001', '010', '010', '010'],
+  8: ['010', '101', '010', '101', '010'],
+  a: ['000', '011', '101', '101', '011'],
+  b: ['100', '110', '101', '101', '110'],
+  c: ['000', '011', '100', '100', '011'],
+  d: ['001', '011', '101', '101', '011'],
+  e: ['010', '101', '111', '100', '011'],
+  f: ['011', '010', '111', '010', '010'],
+  g: ['011', '101', '011', '001', '110'],
+  h: ['100', '110', '101', '101', '101'],
+};
+
+export function drawGlyph(img, ch, x0, y0, scale, color) {
+  const rows = GLYPHS[ch];
+  if (!rows) return;
+  for (let gy = 0; gy < rows.length; gy++) {
+    for (let gx = 0; gx < 3; gx++) {
+      if (rows[gy][gx] === '1') {
+        fillRect(img, x0 + gx * scale, y0 + gy * scale, scale, scale, color);
+      }
+    }
+  }
+}
+
 export function fillRect(img, x0, y0, w, h, color, alpha = 1) {
   for (let y = Math.max(0, y0); y < Math.min(img.height, y0 + h); y++) {
     for (let x = Math.max(0, x0); x < Math.min(img.width, x0 + w); x++) {
@@ -99,7 +156,7 @@ export function blit(img, sprite, dx, dy) {
  * Returns { img, boardRect, screenMatrix }.
  */
 export function renderBoard(cfg) {
-  const { light, dark } = THEMES[cfg.theme];
+  const { light, dark, grain } = THEMES[cfg.theme];
   const bs = cfg.boardSize;
   const cell = bs / 8;
   const margin = cfg.margin ?? 0;
@@ -132,7 +189,15 @@ export function renderBoard(cfg) {
       const y0 = Math.round(margin + r * cell);
       const x1 = Math.round(margin + (c + 1) * cell);
       const y1 = Math.round(margin + (r + 1) * cell);
-      fillRect(img, x0, y0, x1 - x0, y1 - y0, (r + c) % 2 === 0 ? light : dark);
+      const color = (r + c) % 2 === 0 ? light : dark;
+      if (grain) {
+        // Browsers render board textures minified with smoothing, so the
+        // apparent grain amplitude shrinks with cell size.
+        const amp = grain * Math.min(1, cell / 90);
+        fillGrainRect(img, x0, y0, x1 - x0, y1 - y0, color, amp, rand);
+      } else {
+        fillRect(img, x0, y0, x1 - x0, y1 - y0, color);
+      }
     }
   }
 
@@ -145,15 +210,31 @@ export function renderBoard(cfg) {
   }
 
   if (cfg.coords) {
+    // Chess.com-style in-square coordinates: file letters bottom-right of the
+    // bottom row, rank digits top-left of the left column.
+    const scale = Math.max(1, Math.round(cell * 0.035));
+    const files = 'abcdefgh';
     for (let c = 0; c < 8; c++) {
-      const x0 = Math.round(margin + c * cell + cell * 0.82);
-      const y0 = Math.round(margin + 7 * cell + cell * 0.82);
-      fillRect(img, x0, y0, Math.max(2, Math.round(cell * 0.1)), Math.max(3, Math.round(cell * 0.12)), [90, 60, 40]);
+      const ch = cfg.whiteAtBottom ? files[c] : files[7 - c];
+      drawGlyph(
+        img,
+        ch,
+        Math.round(margin + (c + 1) * cell - 4.5 * scale),
+        Math.round(margin + 8 * cell - 7 * scale),
+        scale,
+        (7 + c) % 2 === 0 ? dark : light,
+      );
     }
     for (let r = 0; r < 8; r++) {
-      const x0 = Math.round(margin + cell * 0.06);
-      const y0 = Math.round(margin + r * cell + cell * 0.06);
-      fillRect(img, x0, y0, Math.max(2, Math.round(cell * 0.08)), Math.max(3, Math.round(cell * 0.12)), [90, 60, 40]);
+      const digit = String(cfg.whiteAtBottom ? 8 - r : r + 1);
+      drawGlyph(
+        img,
+        digit,
+        Math.round(margin + cell * 0.06),
+        Math.round(margin + r * cell + cell * 0.06),
+        scale,
+        r % 2 === 0 ? dark : light,
+      );
     }
   }
 

@@ -6,15 +6,18 @@ import { Chess } from 'chess.js';
 import type { RGBAImage, Rect } from '../vision/types';
 import { detectBoard } from '../vision/detect';
 import { classifyBoard } from '../vision/classify';
+import { loadTemplates } from '../vision/templates';
+import { harvestIntoStore, learnedToTemplates, HARVEST_MIN_CONFIDENCE, type LearnedStore } from '../vision/learning';
 import { crop } from '../vision/image';
 import {
   buildFen,
   decideOrientation,
   orientMatrix,
+  placementToMatrix,
   validatePosition,
 } from '../chess/fen';
 import { formatScore, scoreToBarFraction, type UciInfoLine } from '../engine/uci';
-import type { BackgroundToContent, CaptureResponse, EngineUpdate, Settings } from '../messages';
+import type { BackgroundToContent, CaptureResponse, EngineUpdate, Settings, VisionResult } from '../messages';
 import { DEFAULT_SETTINGS } from '../messages';
 import { Overlay, type CssRect } from './overlay';
 import { detectPlayContext } from './safety';
@@ -32,6 +35,7 @@ declare global {
       engineDone: boolean;
       whiteAtBottom: boolean;
       error: string | null;
+      recognizer?: 'cnn' | 'classic';
     };
   }
 }
@@ -85,6 +89,8 @@ class ChessLens {
   private observer: MutationObserver | null = null;
   private messageListener: ((message: BackgroundToContent) => void) | null = null;
   private lastSafeAt = 0;
+  private learned: LearnedStore = {};
+  private learnedLoaded = false;
   private scanQueued = false;
   private lastScanAt = 0;
   private repositionRaf = 0;
@@ -166,7 +172,7 @@ class ChessLens {
 
   // --- Capture ---------------------------------------------------------------
 
-  private async captureViewport(): Promise<{ img: RGBAImage; sx: number; sy: number } | null> {
+  private async captureViewport(): Promise<{ img: RGBAImage; sx: number; sy: number; dataUrl: string } | null> {
     this.overlay.setHidden(true);
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     let resp: CaptureResponse;
@@ -192,7 +198,31 @@ class ChessLens {
       img: { data: data.data, width: data.width, height: data.height },
       sx: data.width / vw,
       sy: data.height / vh,
+      dataUrl: resp.dataUrl,
     };
+  }
+
+  private async imageToDataUrl(img: RGBAImage): Promise<string> {
+    const canvas = new OffscreenCanvas(img.width, img.height);
+    const ctx = canvas.getContext('2d')!;
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
+    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  /** Ask the offscreen CNN recognizer (fenshot) to read a board image. */
+  private async cnnRecognize(dataUrl: string): Promise<VisionResult | null> {
+    try {
+      const result: VisionResult = await chrome.runtime.sendMessage({ type: 'vision-recognize', dataUrl });
+      return result?.ok ? result : null;
+    } catch {
+      return null;
+    }
   }
 
   // --- DOM candidates --------------------------------------------------------
@@ -299,7 +329,38 @@ class ChessLens {
     }
 
     const detected = detectBoard(img, hints);
-    if (!detected) {
+    let rect: Rect | null = detected?.rect ?? null;
+
+    // --- Primary recognizer: the fenshot CNN (offscreen, onnxruntime-web).
+    // Trained across ~72 piece sets and ~55 board themes; reads any theme.
+    // When our geometric detector found the board we send it the crop,
+    // otherwise the whole viewport (fenshot has its own detector).
+    let screenMatrix: ReturnType<typeof placementToMatrix> | null = null;
+    let confidence = 0;
+    let recognizerUsed: 'cnn' | 'classic' = 'cnn';
+    const vision = await this.cnnRecognize(
+      rect ? await this.imageToDataUrl(crop(img, rect)) : captured.dataUrl,
+    );
+    if (vision?.reliable && vision.placement) {
+      try {
+        // fenshot reads as if White were at the bottom of the image; its
+        // rank-8..1 placement therefore maps directly to screen rows.
+        screenMatrix = placementToMatrix(vision.placement);
+        confidence = vision.minConfidence ?? 0.7;
+        if (!rect && vision.corners) {
+          rect = {
+            x: vision.corners.x0,
+            y: vision.corners.y0,
+            w: vision.corners.x1 - vision.corners.x0,
+            h: vision.corners.y1 - vision.corners.y0,
+          };
+        }
+      } catch {
+        screenMatrix = null;
+      }
+    }
+
+    if (!rect) {
       updateDebug({ status: 'no-board' });
       this.overlay.setBoardRect(null);
       this.overlay.setStatus(
@@ -311,7 +372,6 @@ class ChessLens {
 
     // Track which DOM element (if any) produced this rect, for repositioning
     // and change watching.
-    const rect = detected.rect;
     this.source.element = null;
     for (const c of candidates) {
       const hx = c.rect.left * sx, hy = c.rect.top * sy, hw = c.rect.width * sx;
@@ -322,12 +382,23 @@ class ChessLens {
     }
     this.source.cssRect = { x: rect.x / sx, y: rect.y / sy, w: rect.w / sx, h: rect.h / sy };
 
-    // Recognize the position.
-    const boardImg = crop(img, rect);
-    const rec = classifyBoard(boardImg);
-    const auto = decideOrientation(rec.board);
+    // --- Fallback recognizer: classic silhouette matching against bundled
+    // templates plus silhouettes learned from previous validated scans on
+    // this site (works fully offline of any model, and keeps improving).
+    let classicRec: ReturnType<typeof classifyBoard> | null = null;
+    if (!screenMatrix) {
+      recognizerUsed = 'classic';
+      await this.ensureLearnedLoaded();
+      const boardImg = crop(img, rect);
+      const templates = [...loadTemplates(), ...learnedToTemplates(this.learned)];
+      classicRec = classifyBoard(boardImg, templates);
+      screenMatrix = classicRec.board;
+      confidence = classicRec.confidence;
+    }
+
+    const auto = decideOrientation(screenMatrix);
     this.whiteAtBottom = this.orientationFlipped ? !auto.whiteAtBottom : auto.whiteAtBottom;
-    const oriented = orientMatrix(rec.board, this.whiteAtBottom);
+    const oriented = orientMatrix(screenMatrix, this.whiteAtBottom);
     const validation = validatePosition(oriented);
 
     this.overlay.setBoardRect(this.source.cssRect, this.whiteAtBottom);
@@ -342,10 +413,18 @@ class ChessLens {
       return;
     }
 
+    // A validated classic read: harvest this theme's silhouettes so the
+    // fallback keeps adapting to the site.
+    if (classicRec && classicRec.confidence >= HARVEST_MIN_CONFIDENCE && harvestIntoStore(this.learned, classicRec)) {
+      this.saveLearned();
+    }
+    updateDebug({ recognizer: recognizerUsed });
+
     const fen = buildFen(oriented, this.sideToMove);
     const placementSide = fen.split(' ').slice(0, 2).join(' ');
     const notes: string[] = [];
-    if (rec.confidence < 0.45) notes.push('Low recognition confidence — verify the position.');
+    const lowConfidence = recognizerUsed === 'cnn' ? confidence < 0.8 : confidence < 0.45;
+    if (lowConfidence) notes.push('Low recognition confidence — verify the position.');
     if (validation.warnings.length) notes.push(validation.warnings.join('; '));
 
     if (placementSide === this.lastPlacementSide && !userInitiated) {
@@ -478,6 +557,28 @@ class ChessLens {
       this.source.cssRect = { x: r.left, y: r.top, w: r.width, h: r.height };
     }
     if (this.source.cssRect) this.overlay.setBoardRect(this.source.cssRect, this.whiteAtBottom);
+  }
+
+  // --- Adaptive template persistence ----------------------------------------
+
+  private learnedKey(): string {
+    return `learnedTemplates:${location.origin}`;
+  }
+
+  private async ensureLearnedLoaded(): Promise<void> {
+    if (this.learnedLoaded) return;
+    this.learnedLoaded = true;
+    try {
+      const stored = await chrome.storage.local.get(this.learnedKey());
+      const raw = stored[this.learnedKey()];
+      if (raw && typeof raw === 'object') this.learned = raw as LearnedStore;
+    } catch {
+      /* storage unavailable: learning stays session-local */
+    }
+  }
+
+  private saveLearned(): void {
+    chrome.storage.local.set({ [this.learnedKey()]: this.learned }).catch(() => {});
   }
 
   // --- Manual region selection ----------------------------------------------

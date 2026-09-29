@@ -32,6 +32,12 @@ export interface CellClassification {
   margin: number;
   /** Best score per piece type (for coherence fix-ups). */
   typeScores?: Partial<Record<PieceType, number>>;
+  /** Normalized silhouette of the cell (for adaptive template learning). */
+  silhouette?: {
+    grid: Float32Array;
+    relHeight: number;
+    relWidth: number;
+  };
 }
 
 export interface RecognitionResult {

@@ -1,20 +1,22 @@
 import { build } from 'esbuild';
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Resvg } from '@resvg/resvg-js';
 import { PNG } from 'pngjs';
 
 /** Bundle a TS module on the fly and import it (for scripts sharing src/ code). */
 export async function importTs(entry) {
+  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
   const out = await build({
     entryPoints: [resolve(entry)],
     bundle: true,
     format: 'esm',
     platform: 'node',
     write: false,
-    external: [],
+    external: ['onnxruntime-web'],
+    nodePaths: [join(projectRoot, 'node_modules')],
     loader: { '.json': 'json' },
   });
   const dir = mkdtempSync(join(tmpdir(), 'ts-import-'));

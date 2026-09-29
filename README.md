@@ -50,29 +50,37 @@ toolbar click (activeTab)
   └─ content script injected
        ├─ DOM candidates: large square-ish elements (generic, site-agnostic)
        ├─ screen capture of the visible tab (PNG, service worker)
-       ├─ board localization
+       ├─ board localization (own detector)
        │    ├─ candidate verification: 8×8 alternating two-color pattern score
        │    ├─ fallback: full-image scan — 1D gradient projections + combs of
        │    │   9 evenly spaced lines per axis (tensorflow_chessbot-style)
        │    └─ sub-pixel refinement: median edge-transition alignment +
        │        robust per-line grid snapping
-       ├─ per-square recognition
-       │    ├─ background: corner-patch estimate vs. board-wide parity color
-       │    │   (adaptive to per-square highlights and bulky pieces)
+       ├─ PRIMARY recognizer — fenshot CNN (offscreen document)
+       │    ├─ @scoriiu/fenshot (MIT): compact tile classifier trained on
+       │    │   ~72 piece sets × ~55 board themes with screenshot
+       │    │   degradations; 1.3 MB ONNX on onnxruntime-web (WASM)
+       │    ├─ gets our crop (or the full viewport when our detector found
+       │    │   nothing — fenshot has its own gradient-peak detector)
+       │    └─ per-tile confidence; unreliable reads fall through
+       ├─ FALLBACK recognizer — classical vision (fully self-contained)
+       │    ├─ background: corner-patch / board-parity / per-column models
+       │    │   (adaptive to highlights, bulky pieces, wood-grain streaks)
        │    ├─ soft foreground mask (noise-adaptive threshold), hole filling,
-       │    │   largest-component filtering (drops coordinate labels, dots)
+       │    │   morphological opening, largest-component filtering (drops
+       │    │   coordinate labels, texture streaks, move dots)
        │    ├─ piece type: soft-Jaccard silhouette matching against templates
-       │    │   generated from 5 open-source piece sets (cburnett, merida,
-       │    │   chessnut, fantasy, rhosgfx)
+       │    │   from 5 open-source piece sets, PLUS silhouettes learned
+       │    │   per-site from previous validated scans (adapts to any theme)
        │    └─ piece color: tiny logistic model over normalized fill/outline/
-       │        texture features, trained offline on synthetic boards
-       │        (scripts/train-color.mjs) — no ML runtime shipped
-       ├─ coherence: exactly one king per color (K/Q crown confusions get
-       │   demoted), material sanity checks, pawn back-rank checks
+       │        texture features, trained offline (scripts/train-color.mjs)
+       ├─ coherence: exactly one king per color (K/Q crown confusions fixed
+       │   both ways), implausible piece counts demoted, pawn back-rank and
+       │   material sanity checks
        ├─ orientation: army placement + pawn-rank impossibilities
        ├─ FEN: conservative castling inference, side-to-move toggle in UI
        └─ engine: Stockfish 19 Lite (single-thread WASM, ~1.8 MB) in a Web
-           Worker inside an MV3 offscreen document; MultiPV, streamed
+           Worker inside the same MV3 offscreen document; MultiPV, streamed
            info lines → eval bar + panel (UCI→SAN via chess.js)
 ```
 
@@ -128,8 +136,9 @@ node scripts/debug-cell.mjs <fixture-substr> <r> <c>   # one cell's silhouette
 - Works with standard 2D boards with alternating square colors. 3D boards,
   heavily textured/photographic boards and unusual grid decorations are out
   of scope (use ⛶ manual selection for borderline cases).
-- Piece styles very far from the bundled template vocabulary may misread;
-  the panel shows a low-confidence warning in that case.
+- A piece style foreign to both the CNN's training corpus and the template
+  vocabulary may misread; the panel shows a low-confidence warning, and the
+  fallback recognizer learns the site's silhouettes from validated scans.
 - The board must be fully visible in the viewport when scanning.
 - Single-threaded "lite" engine build (still far stronger than humans); the
   full/multi-threaded builds are larger and need cross-origin isolation.

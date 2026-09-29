@@ -154,6 +154,42 @@ export function erodeMask(mask: Float32Array, w: number, h: number, iterations: 
   return cur;
 }
 
+/** Binary dilation (4-neighborhood, `iterations` rounds). */
+export function dilateMask(mask: Uint8Array, w: number, h: number, iterations: number): Uint8Array {
+  let cur = mask;
+  for (let it = 0; it < iterations; it++) {
+    const next = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (
+          cur[i] ||
+          (x > 0 && cur[i - 1]) ||
+          (x < w - 1 && cur[i + 1]) ||
+          (y > 0 && cur[i - w]) ||
+          (y < h - 1 && cur[i + w])
+        ) {
+          next[i] = 1;
+        }
+      }
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+/** Morphological opening used as a support filter: everything that survives
+ *  erode(r)+dilate(r+1) keeps its original soft value, the rest is zeroed.
+ *  Cuts thin texture streaks (wood grain) and the bridges they form between
+ *  pieces and coordinate labels, while leaving piece bodies intact. */
+export function morphOpenSupport(mask: Float32Array, w: number, h: number, r: number): Float32Array {
+  const eroded = erodeMask(mask, w, h, r);
+  const support = dilateMask(eroded, w, h, r + 1);
+  const out = new Float32Array(mask.length);
+  for (let i = 0; i < mask.length; i++) out[i] = support[i] ? mask[i] : 0;
+  return out;
+}
+
 /** Fill enclosed holes in a soft mask: any region not reachable from the cell
  *  border through "background" pixels is considered piece interior.
  *  This makes silhouettes robust when a piece's fill color matches the square

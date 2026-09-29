@@ -83,6 +83,19 @@ emit('special-coords', {
   placement: POSITIONS.start, set: 'merida', theme: 'brown',
   boardSize: 512, whiteAtBottom: true, coords: true,
 });
+// Textured wood + in-square coordinate glyphs at chess.com-like resolution.
+emit('special-wood-coords-large', {
+  placement: POSITIONS.start, set: 'cburnett', theme: 'wood',
+  boardSize: 984, whiteAtBottom: true, coords: true, clutterSeed: 9,
+});
+emit('special-wood-middlegame-flipped', {
+  placement: POSITIONS.middlegame, set: 'chessnut', theme: 'wood',
+  boardSize: 700, whiteAtBottom: false, coords: true, clutterSeed: 21,
+});
+emit('special-wood-tactics-medium', {
+  placement: POSITIONS.tactics, set: 'merida', theme: 'wood',
+  boardSize: 512, whiteAtBottom: true, coords: true, clutterSeed: 33,
+});
 emit('special-highlight-coords-small', {
   placement: POSITIONS.tactics, set: 'chessnut', theme: 'walnut',
   boardSize: 288, whiteAtBottom: false, coords: true, highlight: [[2, 4], [3, 3]],

@@ -31,7 +31,21 @@ export type ContentToBackground =
   | { type: 'analyze'; fen: string; options: EngineOptions }
   | { type: 'stop-analysis' }
   | { type: 'open-options' }
-  | { type: 'get-settings' };
+  | { type: 'get-settings' }
+  | { type: 'vision-recognize'; dataUrl: string };
+
+/** CNN board recognition result (fenshot), relayed from the offscreen host. */
+export interface VisionResult {
+  ok: boolean;
+  /** FEN placement, ranks 8..1, read as if White were at the bottom. */
+  placement?: string;
+  minConfidence?: number;
+  meanConfidence?: number;
+  reliable?: boolean;
+  /** Board bounding box in the submitted image's pixels. */
+  corners?: { x0: number; y0: number; x1: number; y1: number };
+  error?: string;
+}
 
 /** background -> content */
 export type BackgroundToContent =
@@ -42,7 +56,8 @@ export type BackgroundToContent =
 /** background <-> offscreen */
 export type BackgroundToOffscreen =
   | { type: 'engine-analyze'; fen: string; options: EngineOptions; requestId: number }
-  | { type: 'engine-stop' };
+  | { type: 'engine-stop' }
+  | { type: 'offscreen-vision-recognize'; dataUrl: string };
 
 export interface EngineUpdate {
   requestId: number;

@@ -77,6 +77,22 @@ copyFileSync(resolve(root, 'src/offscreen/offscreen.html'), resolve(dist, 'offsc
 copyFileSync(resolve(root, 'src/options/options.html'), resolve(dist, 'options.html'));
 cpSync(resolve(root, 'assets/icons'), resolve(dist, 'icons'), { recursive: true });
 
+// --- CNN vision assets (fenshot model + onnxruntime-web wasm) ----------------
+mkdirSync(resolve(dist, 'vision'), { recursive: true });
+const visionAssets = [
+  ['node_modules/@scoriiu/fenshot/model/chess-tiles-v2.onnx', 'chess-tiles-v2.onnx'],
+  ['node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs', 'ort-wasm-simd-threaded.mjs'],
+  ['node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm', 'ort-wasm-simd-threaded.wasm'],
+];
+for (const [src, name] of visionAssets) {
+  const p = resolve(root, src);
+  if (!existsSync(p)) {
+    console.error(`Missing ${p} — run npm install first.`);
+    process.exit(1);
+  }
+  copyFileSync(p, resolve(dist, 'vision', name));
+}
+
 // --- Engine ------------------------------------------------------------------
 mkdirSync(resolve(dist, 'engine'), { recursive: true });
 const engineDir = resolve(root, 'node_modules/stockfish/bin');

@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Chess Lens — Visual Position Analyzer",
+  "version": "0.1.0",
+  "description": "Recognizes the chessboard on your screen visually and analyzes the position locally with Stockfish. For puzzles, studies and finished games — not live assistance.",
+  "minimum_chrome_version": "116",
+  "action": {
+    "default_title": "Analyze the visible chessboard"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_page": "options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["activeTab", "scripting", "offscreen", "storage"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
+}

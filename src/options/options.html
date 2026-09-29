@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Chess Lens — Settings</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #17161444; color: #222; max-width: 560px; margin: 40px auto; padding: 0 20px;
+      }
+      h1 { font-size: 20px; }
+      fieldset { border: 1px solid #ddd; border-radius: 10px; margin-bottom: 18px; padding: 14px 16px; }
+      legend { font-weight: 600; font-size: 13px; padding: 0 6px; }
+      label { display: flex; align-items: center; gap: 10px; margin: 10px 0; font-size: 14px; }
+      label span.name { flex: 1; }
+      input[type="number"], select { width: 110px; padding: 5px 8px; border: 1px solid #ccc; border-radius: 7px; }
+      .hint { color: #777; font-size: 12px; margin-top: 2px; line-height: 1.5; }
+      .saved { color: #2c7a39; font-size: 13px; visibility: hidden; }
+      .note { background: #fff7e0; border: 1px solid #eadfb2; border-radius: 10px; padding: 10px 14px; font-size: 13px; line-height: 1.5; }
+    </style>
+  </head>
+  <body>
+    <h1>Chess Lens — Settings</h1>
+
+    <fieldset>
+      <legend>Engine</legend>
+      <label><span class="name">Search depth limit</span>
+        <input id="depth" type="number" min="0" max="40" step="1" />
+      </label>
+      <div class="hint">0 = no depth limit (time limit only).</div>
+      <label><span class="name">Time budget per position (ms)</span>
+        <input id="movetime" type="number" min="0" max="120000" step="500" />
+      </label>
+      <div class="hint">0 = no time limit (depth limit only). If both are set, the first one reached stops the search.</div>
+      <label><span class="name">Lines (MultiPV)</span>
+        <select id="multipv">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+        </select>
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Behavior</legend>
+      <label><span class="name">Watch the board and re-analyze on changes</span>
+        <input id="watch" type="checkbox" />
+      </label>
+    </fieldset>
+
+    <p class="note">
+      Chess Lens is an analysis tool for puzzles, studies, local boards and finished
+      games. It refuses to run when the page looks like a competitive game in
+      progress (live-play URLs, running clocks). Please respect the fair-play rules
+      of the sites you visit.
+    </p>
+
+    <p class="saved" id="saved">Saved ✓</p>
+    <script src="options.js"></script>
+  </body>
+</html>

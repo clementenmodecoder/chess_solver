@@ -1,0 +1,544 @@
+/** Content script: orchestrates capture -> board detection -> recognition ->
+ *  FEN -> engine analysis, and drives the overlay UI. Injected on demand via
+ *  the toolbar action (activeTab), never automatically. */
+
+import { Chess } from 'chess.js';
+import type { RGBAImage, Rect } from '../vision/types';
+import { detectBoard } from '../vision/detect';
+import { classifyBoard } from '../vision/classify';
+import { crop } from '../vision/image';
+import {
+  buildFen,
+  decideOrientation,
+  orientMatrix,
+  validatePosition,
+} from '../chess/fen';
+import { formatScore, scoreToBarFraction, type UciInfoLine } from '../engine/uci';
+import type { BackgroundToContent, CaptureResponse, EngineUpdate, Settings } from '../messages';
+import { DEFAULT_SETTINGS } from '../messages';
+import { Overlay, type CssRect } from './overlay';
+import { detectPlayContext } from './safety';
+
+declare global {
+  interface Window {
+    __chessLensActive?: boolean;
+    /** Debug/E2E hook: latest recognition + engine state. */
+    __chessLensDebug?: {
+      fen: string | null;
+      status: string;
+      depth: number;
+      scoreText: string;
+      bestMove: string;
+      engineDone: boolean;
+      whiteAtBottom: boolean;
+      error: string | null;
+    };
+  }
+}
+
+function updateDebug(partial: Partial<NonNullable<Window['__chessLensDebug']>>): void {
+  if (!window.__chessLensDebug) {
+    window.__chessLensDebug = {
+      fen: null,
+      status: 'boot',
+      depth: 0,
+      scoreText: '',
+      bestMove: '',
+      engineDone: false,
+      whiteAtBottom: true,
+      error: null,
+    };
+  }
+  Object.assign(window.__chessLensDebug, partial);
+  // Content scripts run in an isolated world; mirror the state into the
+  // shared DOM so page-world tooling (and the E2E suite) can observe it.
+  try {
+    document.documentElement.dataset.chessLensDebug = JSON.stringify(window.__chessLensDebug);
+  } catch {
+    /* ignore */
+  }
+}
+
+interface BoardSource {
+  /** Live DOM element tracking (best: survives scroll/resize). */
+  element: Element | null;
+  /** Viewport rect (CSS px) at last successful detection. */
+  cssRect: CssRect | null;
+  /** Manual selection rect (CSS px, viewport). */
+  manualRect: CssRect | null;
+}
+
+class ChessLens {
+  private overlay: Overlay;
+  private settings: Settings = DEFAULT_SETTINGS;
+  private source: BoardSource = { element: null, cssRect: null, manualRect: null };
+  private lastFen: string | null = null;
+  private lastPlacementSide: string | null = null;
+  private sideToMove: 'w' | 'b' = 'w';
+  private whiteAtBottom = true;
+  private orientationFlipped = false;
+  private currentRequestId = 0;
+  private scanning = false;
+  private destroyed = false;
+  private paused = false;
+  private watchTimer: number | null = null;
+  private observer: MutationObserver | null = null;
+  private messageListener: ((message: BackgroundToContent) => void) | null = null;
+  private lastSafeAt = 0;
+  private scanQueued = false;
+  private lastScanAt = 0;
+  private repositionRaf = 0;
+
+  constructor() {
+    this.overlay = new Overlay({
+      onRescan: () => this.scan(true),
+      onPauseToggle: (paused) => {
+        this.paused = paused;
+        this.overlay.setStatus(paused ? 'paused' : 'idle', paused ? 'Automatic analysis paused.' : undefined);
+        if (!paused) this.scan(false);
+      },
+      onCopyFen: () => {
+        if (this.lastFen) {
+          navigator.clipboard.writeText(this.lastFen).catch(() => {});
+        }
+      },
+      onFlip: () => {
+        this.orientationFlipped = !this.orientationFlipped;
+        this.scan(true);
+      },
+      onSideChange: (side) => {
+        this.sideToMove = side;
+        this.reanalyzeSameBoard();
+      },
+      onSelectRegion: () => this.selectRegion(),
+      onOpenOptions: () => chrome.runtime.sendMessage({ type: 'open-options' }),
+      onClose: () => this.destroy(),
+    });
+
+    this.messageListener = (message: BackgroundToContent) => {
+      if (this.destroyed) return;
+      switch (message.type) {
+        case 'engine-update':
+          this.onEngineUpdate(message.update);
+          break;
+        case 'settings-changed':
+          this.settings = message.settings;
+          break;
+        default:
+          break;
+      }
+    };
+    chrome.runtime.onMessage.addListener(this.messageListener);
+
+    const reposition = () => {
+      cancelAnimationFrame(this.repositionRaf);
+      this.repositionRaf = requestAnimationFrame(() => this.updateBarPosition());
+    };
+    window.addEventListener('scroll', reposition, { passive: true, capture: true });
+    window.addEventListener('resize', reposition, { passive: true });
+  }
+
+  async start(): Promise<void> {
+    updateDebug({ status: 'detecting' });
+    this.overlay.mount();
+    this.overlay.setPanelOpen(true);
+    this.overlay.setStatus('detecting', 'Looking for a chessboard…');
+    try {
+      this.settings = (await chrome.runtime.sendMessage({ type: 'get-settings' })) ?? DEFAULT_SETTINGS;
+    } catch {
+      this.settings = DEFAULT_SETTINGS;
+    }
+    await this.scan(true);
+  }
+
+  get isDestroyed(): boolean {
+    return this.destroyed;
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.stopWatching();
+    if (this.messageListener) chrome.runtime.onMessage.removeListener(this.messageListener);
+    chrome.runtime.sendMessage({ type: 'stop-analysis' }).catch(() => {});
+    this.overlay.destroy();
+  }
+
+  // --- Capture ---------------------------------------------------------------
+
+  private async captureViewport(): Promise<{ img: RGBAImage; sx: number; sy: number } | null> {
+    this.overlay.setHidden(true);
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    let resp: CaptureResponse;
+    try {
+      resp = await chrome.runtime.sendMessage({ type: 'capture' });
+    } finally {
+      this.overlay.setHidden(false);
+    }
+    if (!resp?.ok || !resp.dataUrl) {
+      this.overlay.setStatus('error', `Screen capture failed: ${resp?.error ?? 'unknown error'}`);
+      return null;
+    }
+    const blob = await (await fetch(resp.dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob);
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    ctx.drawImage(bitmap, 0, 0);
+    const data = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+    bitmap.close();
+    const vw = window.visualViewport?.width ?? window.innerWidth;
+    const vh = window.visualViewport?.height ?? window.innerHeight;
+    return {
+      img: { data: data.data, width: data.width, height: data.height },
+      sx: data.width / vw,
+      sy: data.height / vh,
+    };
+  }
+
+  // --- DOM candidates --------------------------------------------------------
+
+  private collectDomCandidates(): { el: Element; rect: DOMRect }[] {
+    const out: { el: Element; rect: DOMRect }[] = [];
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const all = document.querySelectorAll<HTMLElement>('body *');
+    let inspected = 0;
+    for (const el of all) {
+      if (inspected++ > 20000) break;
+      const w = el.offsetWidth ?? 0;
+      const h = el.offsetHeight ?? 0;
+      if (w < 160 || h < 160) continue;
+      if (Math.abs(w - h) > Math.max(w, h) * 0.1) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 160) continue;
+      if (rect.right < 0 || rect.bottom < 0 || rect.left > vw || rect.top > vh) continue;
+      out.push({ el, rect });
+    }
+    // Largest first; drop near-duplicate rects (nested wrappers).
+    out.sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height);
+    const dedup: { el: Element; rect: DOMRect }[] = [];
+    for (const c of out) {
+      if (
+        dedup.some(
+          (d) =>
+            Math.abs(d.rect.left - c.rect.left) < 8 &&
+            Math.abs(d.rect.top - c.rect.top) < 8 &&
+            Math.abs(d.rect.width - c.rect.width) < 12,
+        )
+      ) {
+        continue;
+      }
+      dedup.push(c);
+      if (dedup.length >= 8) break;
+    }
+    return dedup;
+  }
+
+  // --- Scan pipeline ---------------------------------------------------------
+
+  async scan(userInitiated: boolean): Promise<void> {
+    if (this.scanning || this.destroyed) {
+      this.scanQueued = true;
+      return;
+    }
+    this.scanning = true;
+    this.scanQueued = false;
+    this.lastScanAt = Date.now();
+    try {
+      await this.doScan(userInitiated);
+    } catch (err) {
+      updateDebug({ status: 'error', error: String((err as Error)?.message ?? err) });
+      this.overlay.setStatus('error', `Scan failed: ${String((err as Error)?.message ?? err)}`);
+    } finally {
+      this.scanning = false;
+      if (this.scanQueued && !this.destroyed) {
+        setTimeout(() => this.scan(false), 250);
+      }
+    }
+  }
+
+  private async doScan(userInitiated: boolean): Promise<void> {
+    if (userInitiated) this.overlay.setStatus('detecting', 'Scanning…');
+
+    // Cache the "safe" verdict briefly so watch-mode rescans don't pay the
+    // 1.2s clock-sampling delay on pages that display static clock text.
+    let context: 'safe' | 'live-play' = 'safe';
+    if (Date.now() - this.lastSafeAt > 30000) {
+      context = await detectPlayContext();
+      if (context === 'safe') this.lastSafeAt = Date.now();
+    }
+    if (context === 'live-play') {
+      this.stopWatching();
+      chrome.runtime.sendMessage({ type: 'stop-analysis' }).catch(() => {});
+      updateDebug({ status: 'blocked' });
+      this.overlay.setStatus(
+        'blocked',
+        'This looks like a competitive game in progress. Chess Lens only analyzes puzzles, studies and finished games.',
+      );
+      return;
+    }
+
+    const captured = await this.captureViewport();
+    if (!captured) return;
+    const { img, sx, sy } = captured;
+
+    // Hints: manual rect first, then tracked element, then DOM candidates.
+    const hints: Rect[] = [];
+    let candidates: { el: Element; rect: DOMRect }[] = [];
+    if (this.source.manualRect) {
+      const m = this.source.manualRect;
+      hints.push({ x: m.x * sx, y: m.y * sy, w: m.w * sx, h: m.h * sy });
+    }
+    if (this.source.element?.isConnected) {
+      const r = this.source.element.getBoundingClientRect();
+      hints.push({ x: r.left * sx, y: r.top * sy, w: r.width * sx, h: r.height * sy });
+    }
+    candidates = this.collectDomCandidates();
+    for (const c of candidates) {
+      hints.push({ x: c.rect.left * sx, y: c.rect.top * sy, w: c.rect.width * sx, h: c.rect.height * sy });
+    }
+
+    const detected = detectBoard(img, hints);
+    if (!detected) {
+      updateDebug({ status: 'no-board' });
+      this.overlay.setBoardRect(null);
+      this.overlay.setStatus(
+        'error',
+        'No chessboard found on this page. If one is visible, use ⛶ to select it manually.',
+      );
+      return;
+    }
+
+    // Track which DOM element (if any) produced this rect, for repositioning
+    // and change watching.
+    const rect = detected.rect;
+    this.source.element = null;
+    for (const c of candidates) {
+      const hx = c.rect.left * sx, hy = c.rect.top * sy, hw = c.rect.width * sx;
+      if (Math.abs(hx - rect.x) < hw * 0.1 && Math.abs(hy - rect.y) < hw * 0.1 && Math.abs(hw - rect.w) < hw * 0.12) {
+        this.source.element = c.el;
+        break;
+      }
+    }
+    this.source.cssRect = { x: rect.x / sx, y: rect.y / sy, w: rect.w / sx, h: rect.h / sy };
+
+    // Recognize the position.
+    const boardImg = crop(img, rect);
+    const rec = classifyBoard(boardImg);
+    const auto = decideOrientation(rec.board);
+    this.whiteAtBottom = this.orientationFlipped ? !auto.whiteAtBottom : auto.whiteAtBottom;
+    const oriented = orientMatrix(rec.board, this.whiteAtBottom);
+    const validation = validatePosition(oriented);
+
+    this.overlay.setBoardRect(this.source.cssRect, this.whiteAtBottom);
+
+    if (!validation.ok) {
+      updateDebug({ status: 'invalid', error: validation.errors.join('; ') });
+      this.overlay.setStatus(
+        'error',
+        `Position not recognized reliably: ${validation.errors.join('; ')}. Try ⟳ or select the board with ⛶.`,
+      );
+      this.startWatching();
+      return;
+    }
+
+    const fen = buildFen(oriented, this.sideToMove);
+    const placementSide = fen.split(' ').slice(0, 2).join(' ');
+    const notes: string[] = [];
+    if (rec.confidence < 0.45) notes.push('Low recognition confidence — verify the position.');
+    if (validation.warnings.length) notes.push(validation.warnings.join('; '));
+
+    if (placementSide === this.lastPlacementSide && !userInitiated) {
+      // Position unchanged: keep current analysis running.
+      this.startWatching();
+      return;
+    }
+    this.lastFen = fen;
+    this.lastPlacementSide = placementSide;
+    updateDebug({ fen, status: 'analyzing', whiteAtBottom: this.whiteAtBottom, error: null });
+
+    this.overlay.setStatus('analyzing', notes.length ? notes.join(' ') : undefined);
+    await this.requestAnalysis(fen);
+    this.startWatching();
+  }
+
+  private async requestAnalysis(fen: string): Promise<void> {
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: 'analyze',
+        fen,
+        options: this.settings.engine,
+      });
+      if (resp?.ok) {
+        this.currentRequestId = resp.requestId;
+      } else {
+        this.overlay.setStatus('error', `Engine error: ${resp?.error ?? 'unavailable'}`);
+      }
+    } catch (err) {
+      this.overlay.setStatus('error', `Engine error: ${String((err as Error)?.message ?? err)}`);
+    }
+  }
+
+  private reanalyzeSameBoard(): void {
+    if (!this.lastFen) return;
+    const parts = this.lastFen.split(' ');
+    parts[1] = this.sideToMove;
+    this.lastFen = parts.join(' ');
+    this.lastPlacementSide = parts.slice(0, 2).join(' ');
+    this.overlay.setStatus('analyzing');
+    this.requestAnalysis(this.lastFen);
+  }
+
+  // --- Engine updates --------------------------------------------------------
+
+  private onEngineUpdate(update: EngineUpdate): void {
+    if (update.requestId !== this.currentRequestId) return;
+    if (update.error) {
+      updateDebug({ error: update.error });
+      this.overlay.setStatus('error', `Engine: ${update.error}`);
+      return;
+    }
+    if (!update.lines.length) return;
+    const main = update.lines[0];
+    const chess = this.lastFen ? tryChess(this.lastFen) : null;
+    const bestSan = chess && main.pv.length ? sanLine(chess, main.pv.slice(0, 1)) : main.pv[0] ?? '';
+    const view = {
+      barFraction: scoreToBarFraction(main.score),
+      scoreText: formatScore(main.score),
+      bestMove: bestSan,
+      depth: main.depth,
+      nps: main.nps,
+      engineName: update.engineName,
+      lines: update.lines.map((l: UciInfoLine) => ({
+        scoreText: formatScore(l.score),
+        moves: chess ? sanLine(chess, l.pv.slice(0, 10)) : l.pv.slice(0, 10).join(' '),
+      })),
+    };
+    this.overlay.setEval(view);
+    updateDebug({
+      depth: main.depth,
+      scoreText: view.scoreText,
+      bestMove: view.bestMove ?? '',
+      engineDone: update.done,
+    });
+    if (update.done) {
+      this.overlay.setStatus(this.paused ? 'paused' : 'idle');
+    }
+  }
+
+  // --- Watching for board changes -------------------------------------------
+
+  private startWatching(): void {
+    this.stopWatching();
+    if (!this.settings.watchBoard || this.paused) return;
+    const onChange = () => {
+      if (this.paused || this.destroyed) return;
+      const since = Date.now() - this.lastScanAt;
+      if (this.scanning || since < 900) {
+        this.scanQueued = true;
+        if (this.watchTimer === null) {
+          this.watchTimer = window.setTimeout(() => {
+            this.watchTimer = null;
+            if (this.scanQueued) this.scan(false);
+          }, Math.max(250, 900 - since));
+        }
+        return;
+      }
+      this.scan(false);
+    };
+    if (this.source.element?.isConnected) {
+      this.observer = new MutationObserver(() => onChange());
+      this.observer.observe(this.source.element, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+    } else {
+      // No trackable element (manual/scan detection): light polling.
+      this.watchTimer = window.setTimeout(() => {
+        this.watchTimer = null;
+        this.scan(false);
+      }, 2500);
+    }
+  }
+
+  private stopWatching(): void {
+    this.observer?.disconnect();
+    this.observer = null;
+    if (this.watchTimer !== null) {
+      clearTimeout(this.watchTimer);
+      this.watchTimer = null;
+    }
+  }
+
+  private updateBarPosition(): void {
+    if (this.source.element?.isConnected) {
+      const r = this.source.element.getBoundingClientRect();
+      this.source.cssRect = { x: r.left, y: r.top, w: r.width, h: r.height };
+    }
+    if (this.source.cssRect) this.overlay.setBoardRect(this.source.cssRect, this.whiteAtBottom);
+  }
+
+  // --- Manual region selection ----------------------------------------------
+
+  private async selectRegion(): Promise<void> {
+    const rect = await this.overlay.beginRegionSelection();
+    if (!rect) return;
+    this.source.manualRect = rect;
+    this.source.element = null;
+    await this.scan(true);
+    // Refine the manual rect with whatever the detector settled on.
+    if (this.source.cssRect) this.source.manualRect = this.source.cssRect;
+  }
+}
+
+function tryChess(fen: string): Chess | null {
+  try {
+    return new Chess(fen);
+  } catch {
+    return null;
+  }
+}
+
+/** Convert a UCI move list to a SAN string, tolerating illegal tails. */
+function sanLine(base: Chess, uciMoves: string[]): string {
+  const chess = new Chess(base.fen());
+  const parts: string[] = [];
+  for (const uci of uciMoves) {
+    try {
+      const move = chess.move({
+        from: uci.slice(0, 2),
+        to: uci.slice(2, 4),
+        promotion: uci.length > 4 ? (uci[4] as 'q' | 'r' | 'b' | 'n') : undefined,
+      });
+      parts.push(move.san);
+    } catch {
+      parts.push(uci);
+      break;
+    }
+  }
+  return parts.join(' ');
+}
+
+// --- Bootstrapping -----------------------------------------------------------
+// A single global toggle handler owns the instance lifecycle so a toolbar
+// click always works: destroy the running instance, or start a fresh one
+// (the content script file stays loaded after destroy).
+let instance: ChessLens | null = null;
+
+if (!window.__chessLensActive) {
+  window.__chessLensActive = true;
+  chrome.runtime.onMessage.addListener((message: BackgroundToContent) => {
+    if (message.type !== 'toggle-overlay') return;
+    if (instance && !instance.isDestroyed) {
+      instance.destroy();
+      instance = null;
+    } else {
+      instance = new ChessLens();
+      instance.start();
+    }
+  });
+  instance = new ChessLens();
+  instance.start();
+}

@@ -28,7 +28,7 @@ export const DEFAULT_SETTINGS: Settings = {
 /** content -> background */
 export type ContentToBackground =
   | { type: 'capture' }
-  | { type: 'analyze'; fen: string; options: EngineOptions }
+  | { type: 'analyze'; fen: string; options: EngineOptions; requestId: number }
   | { type: 'stop-analysis' }
   | { type: 'open-options' }
   | { type: 'get-settings' }
@@ -53,14 +53,18 @@ export type BackgroundToContent =
   | { type: 'engine-update'; update: EngineUpdate }
   | { type: 'settings-changed'; settings: Settings };
 
-/** background <-> offscreen */
+/** background <-> offscreen.
+ *  tabId travels inside the messages: the MV3 service worker is ephemeral,
+ *  so routing must not depend on any state it keeps in memory. */
 export type BackgroundToOffscreen =
-  | { type: 'engine-analyze'; fen: string; options: EngineOptions; requestId: number }
+  | { type: 'engine-analyze'; fen: string; options: EngineOptions; requestId: number; tabId: number }
   | { type: 'engine-stop' }
   | { type: 'offscreen-vision-recognize'; dataUrl: string };
 
 export interface EngineUpdate {
   requestId: number;
+  /** Tab that requested the analysis; the service worker routes on this. */
+  tabId: number;
   /** Latest info per multipv index (1-based); White-POV scores. */
   lines: UciInfoLine[];
   bestMove?: string;

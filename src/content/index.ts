@@ -4,7 +4,7 @@
 
 import { Chess } from 'chess.js';
 import type { RGBAImage, Rect } from '../vision/types';
-import { detectBoard } from '../vision/detect';
+import { detectBoard, snapGrid } from '../vision/detect';
 import { classifyBoard } from '../vision/classify';
 import { loadTemplates } from '../vision/templates';
 import { harvestIntoStore, learnedToTemplates, HARVEST_MIN_CONFIDENCE, type LearnedStore } from '../vision/learning';
@@ -36,6 +36,9 @@ declare global {
       whiteAtBottom: boolean;
       error: string | null;
       recognizer?: 'cnn' | 'classic';
+      /** How many times the overlay was hidden for a capture (flicker probe). */
+      hideCount?: number;
+      scanCount?: number;
     };
   }
 }
@@ -91,6 +94,8 @@ class ChessLens {
   private lastSafeAt = 0;
   private learned: LearnedStore = {};
   private learnedLoaded = false;
+  private lastBoardHash: number | null = null;
+  private unchangedStreak = 0;
   private scanQueued = false;
   private lastScanAt = 0;
   private repositionRaf = 0;
@@ -136,6 +141,15 @@ class ChessLens {
     };
     chrome.runtime.onMessage.addListener(this.messageListener);
 
+    // Debug/E2E hooks: allow the page to trigger UI commands that live
+    // inside the closed shadow root (used by the automated test-suite).
+    document.addEventListener('chess-lens-debug', (e: Event) => {
+      if (this.destroyed) return;
+      const cmd = (e as CustomEvent).detail;
+      if (cmd === 'rescan') this.scan(true);
+      else if (cmd === 'select-region') this.selectRegion();
+    });
+
     const reposition = () => {
       cancelAnimationFrame(this.repositionRaf);
       this.repositionRaf = requestAnimationFrame(() => this.updateBarPosition());
@@ -173,13 +187,26 @@ class ChessLens {
   // --- Capture ---------------------------------------------------------------
 
   private async captureViewport(): Promise<{ img: RGBAImage; sx: number; sy: number; dataUrl: string } | null> {
-    this.overlay.setHidden(true);
+    // Hide the overlay ONLY when it could contaminate the board pixels
+    // (unknown board rect yet, or actual overlap). Hiding on every automatic
+    // re-scan makes the whole UI flicker.
+    const mustHide = !this.source.cssRect || this.overlay.overlapsRect(this.source.cssRect);
+    if (mustHide) updateDebug({ hideCount: (window.__chessLensDebug?.hideCount ?? 0) + 1 });
+    // The arrow always sits on the board: hide it for every capture (a
+    // one-frame blink) or the recognizer reads it back as pieces.
+    this.overlay.setArrowHidden(true);
+    if (mustHide) this.overlay.setHidden(true);
+    // Two rAFs get us past the next paint, plus a short real delay so the
+    // compositor actually submits the arrow-less frame before the capture
+    // (captureVisibleTab can otherwise return the previous composited frame).
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    await new Promise((r) => setTimeout(r, 60));
     let resp: CaptureResponse;
     try {
       resp = await chrome.runtime.sendMessage({ type: 'capture' });
     } finally {
-      this.overlay.setHidden(false);
+      this.overlay.setArrowHidden(false);
+      if (mustHide) this.overlay.setHidden(false);
     }
     if (!resp?.ok || !resp.dataUrl) {
       this.overlay.setStatus('error', `Screen capture failed: ${resp?.error ?? 'unknown error'}`);
@@ -308,28 +335,42 @@ class ChessLens {
       return;
     }
 
+    updateDebug({ scanCount: (window.__chessLensDebug?.scanCount ?? 0) + 1 });
     const captured = await this.captureViewport();
     if (!captured) return;
     const { img, sx, sy } = captured;
 
-    // Hints: manual rect first, then tracked element, then DOM candidates.
-    const hints: Rect[] = [];
+    let rect: Rect | null = null;
     let candidates: { el: Element; rect: DOMRect }[] = [];
     if (this.source.manualRect) {
+      // The user drew this region: trust it. Only snap the grid sub-pixel;
+      // never re-run detection that could reject or replace it.
       const m = this.source.manualRect;
-      hints.push({ x: m.x * sx, y: m.y * sy, w: m.w * sx, h: m.h * sy });
-    }
-    if (this.source.element?.isConnected) {
-      const r = this.source.element.getBoundingClientRect();
-      hints.push({ x: r.left * sx, y: r.top * sy, w: r.width * sx, h: r.height * sy });
-    }
-    candidates = this.collectDomCandidates();
-    for (const c of candidates) {
-      hints.push({ x: c.rect.left * sx, y: c.rect.top * sy, w: c.rect.width * sx, h: c.rect.height * sy });
+      rect = snapGrid(img, { x: m.x * sx, y: m.y * sy, w: m.w * sx, h: m.h * sy });
+    } else {
+      const hints: Rect[] = [];
+      if (this.source.element?.isConnected) {
+        const r = this.source.element.getBoundingClientRect();
+        hints.push({ x: r.left * sx, y: r.top * sy, w: r.width * sx, h: r.height * sy });
+      }
+      candidates = this.collectDomCandidates();
+      for (const c of candidates) {
+        hints.push({ x: c.rect.left * sx, y: c.rect.top * sy, w: c.rect.width * sx, h: c.rect.height * sy });
+      }
+      rect = detectBoard(img, hints)?.rect ?? null;
     }
 
-    const detected = detectBoard(img, hints);
-    let rect: Rect | null = detected?.rect ?? null;
+    // Cheap change gate for watch mode: when the board pixels have not
+    // changed since the last scan, stop here (no recognizer, no UI churn).
+    if (rect) {
+      const hash = sampleHash(img, rect);
+      if (!userInitiated && hash === this.lastBoardHash) {
+        this.unchangedStreak++;
+        this.startWatching();
+        return;
+      }
+      this.lastBoardHash = hash;
+    }
 
     // --- Primary recognizer: the fenshot CNN (offscreen, onnxruntime-web).
     // Trained across ~72 piece sets and ~55 board themes; reads any theme.
@@ -429,28 +470,34 @@ class ChessLens {
 
     if (placementSide === this.lastPlacementSide && !userInitiated) {
       // Position unchanged: keep current analysis running.
+      this.unchangedStreak++;
       this.startWatching();
       return;
     }
+    this.unchangedStreak = 0;
     this.lastFen = fen;
     this.lastPlacementSide = placementSide;
     updateDebug({ fen, status: 'analyzing', whiteAtBottom: this.whiteAtBottom, error: null });
 
+    this.overlay.setBestMoveArrow(null, this.whiteAtBottom);
     this.overlay.setStatus('analyzing', notes.length ? notes.join(' ') : undefined);
     await this.requestAnalysis(fen);
     this.startWatching();
   }
 
   private async requestAnalysis(fen: string): Promise<void> {
+    // The request id is generated here, BEFORE the request leaves, so no
+    // engine update can ever race ahead of it.
+    const requestId = Date.now() * 16 + ((this.currentRequestId + 1) % 16);
+    this.currentRequestId = requestId;
     try {
       const resp = await chrome.runtime.sendMessage({
         type: 'analyze',
         fen,
         options: this.settings.engine,
+        requestId,
       });
-      if (resp?.ok) {
-        this.currentRequestId = resp.requestId;
-      } else {
+      if (!resp?.ok) {
         this.overlay.setStatus('error', `Engine error: ${resp?.error ?? 'unavailable'}`);
       }
     } catch (err) {
@@ -494,6 +541,7 @@ class ChessLens {
       })),
     };
     this.overlay.setEval(view);
+    this.overlay.setBestMoveArrow(main.pv[0] ?? null, this.whiteAtBottom);
     updateDebug({
       depth: main.depth,
       scoreText: view.scoreText,
@@ -507,19 +555,26 @@ class ChessLens {
 
   // --- Watching for board changes -------------------------------------------
 
+  /** Minimum delay between automatic re-scans. Pages that mutate constantly
+   *  without the position changing (hover highlights, clocks, ads) back the
+   *  cadence off up to 6s; a position change resets it to 1.2s. */
+  private watchInterval(): number {
+    return Math.min(6000, 1200 * (1 + this.unchangedStreak));
+  }
+
   private startWatching(): void {
     this.stopWatching();
     if (!this.settings.watchBoard || this.paused) return;
     const onChange = () => {
       if (this.paused || this.destroyed) return;
-      const since = Date.now() - this.lastScanAt;
-      if (this.scanning || since < 900) {
+      const wait = this.lastScanAt + this.watchInterval() - Date.now();
+      if (this.scanning || wait > 0) {
         this.scanQueued = true;
         if (this.watchTimer === null) {
           this.watchTimer = window.setTimeout(() => {
             this.watchTimer = null;
             if (this.scanQueued) this.scan(false);
-          }, Math.max(250, 900 - since));
+          }, Math.max(250, wait));
         }
         return;
       }
@@ -538,7 +593,7 @@ class ChessLens {
       this.watchTimer = window.setTimeout(() => {
         this.watchTimer = null;
         this.scan(false);
-      }, 2500);
+      }, Math.max(2500, this.watchInterval()));
     }
   }
 
@@ -592,6 +647,27 @@ class ChessLens {
     // Refine the manual rect with whatever the detector settled on.
     if (this.source.cssRect) this.source.manualRect = this.source.cssRect;
   }
+}
+
+/** Cheap content hash of a board region: sampled pixel sums. */
+function sampleHash(img: RGBAImage, rect: { x: number; y: number; w: number; h: number }): number {
+  const x0 = Math.max(0, Math.round(rect.x));
+  const y0 = Math.max(0, Math.round(rect.y));
+  const x1 = Math.min(img.width, Math.round(rect.x + rect.w));
+  const y1 = Math.min(img.height, Math.round(rect.y + rect.h));
+  let h = 2166136261 >>> 0;
+  const stepY = Math.max(1, Math.floor((y1 - y0) / 64));
+  const stepX = Math.max(1, Math.floor((x1 - x0) / 64));
+  for (let y = y0; y < y1; y += stepY) {
+    for (let x = x0; x < x1; x += stepX) {
+      const i = (y * img.width + x) * 4;
+      h = (h ^ img.data[i]) >>> 0;
+      h = Math.imul(h, 16777619) >>> 0;
+      h = (h ^ img.data[i + 1]) >>> 0;
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+  }
+  return h;
 }
 
 function tryChess(fen: string): Chess | null {

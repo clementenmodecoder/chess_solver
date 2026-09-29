@@ -199,6 +199,76 @@ try {
     await page.close();
   }
 
+  // ---- Scenario 3b: automatic rescans do not flicker the overlay -------------
+  {
+    const page = await context.newPage();
+    await page.goto(`${base}/board?img=cburnett-start-brown-256.png&size=512`);
+    await page.bringToFront();
+    await inject(page);
+    await waitDebug(page, (dbg) => dbg?.fen != null, 30000);
+    const before = await readDebug(page);
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => document.dispatchEvent(new CustomEvent('chess-lens-debug', { detail: 'rescan' })));
+      await page.waitForTimeout(900);
+    }
+    const after = await readDebug(page);
+    check(after.scanCount > before.scanCount, `rescans ran (${before.scanCount} -> ${after.scanCount})`);
+    check(
+      (after.hideCount ?? 0) <= (before.hideCount ?? 0),
+      `overlay never hidden during rescans (hides ${before.hideCount} -> ${after.hideCount})`,
+    );
+    check(
+      after.error == null && after.status !== 'invalid',
+      `rescans stay clean - no arrow contamination (status ${after.status}, error ${after.error})`,
+    );
+    check(
+      after.fen === before.fen,
+      'position unchanged across rescans',
+    );
+    await page.close();
+  }
+
+  // ---- Scenario 3c: manual region selection ----------------------------------
+  {
+    const page = await context.newPage();
+    // Board drawn at a known position: margin 24 + centered layout from /board page.
+    await page.goto(`${base}/board?img=merida-middlegame-green-600-flipped.png&size=480`);
+    await page.bringToFront();
+    await inject(page);
+    await waitDebug(page, (dbg) => dbg?.fen != null, 30000);
+
+    // Locate the rendered <img> so the drag brackets the real board.
+    const box = await page.locator('#board').boundingBox();
+    await page.evaluate(() => document.dispatchEvent(new CustomEvent('chess-lens-debug', { detail: 'select-region' })));
+    await page.waitForTimeout(300);
+    await page.mouse.move(box.x - 6, box.y - 6);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width + 6, box.y + box.height + 6, { steps: 8 });
+    await page.mouse.up();
+    await waitDebug(page, (dbg) => dbg?.fen != null && dbg.status === 'analyzing', 30000);
+    const dbg = await readDebug(page);
+    check(
+      dbg.fen.startsWith('r1bq1rk1/pp2ppbp/2np1np1'),
+      `manual selection recognized the board (got: ${dbg.fen})`,
+    );
+
+    // Cancel path: opening the selector and just clicking must leave the page usable.
+    await page.evaluate(() => document.dispatchEvent(new CustomEvent('chess-lens-debug', { detail: 'select-region' })));
+    await page.waitForTimeout(200);
+    await page.mouse.click(30, 30);
+    await page.waitForTimeout(300);
+    const clickable = await page.evaluate(() => {
+      let got = false;
+      const h = () => (got = true);
+      document.body.addEventListener('click', h, { once: true });
+      document.body.click();
+      document.body.removeEventListener('click', h);
+      return got;
+    });
+    check(clickable, 'page stays clickable after cancelled selection');
+    await page.close();
+  }
+
   // ---- Scenario 4: live-game lookalike is blocked ----------------------------
   {
     const page = await context.newPage();

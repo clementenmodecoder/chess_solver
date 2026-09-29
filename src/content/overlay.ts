@@ -112,6 +112,8 @@ const CSS = `
 .btn.active { background: rgba(88,179,104,.25); color: #b9e3b0; }
 .btn.side-b { background: rgba(0,0,0,.5); color: #eee; }
 
+.arrow-layer { position: absolute; pointer-events: none; }
+
 .select-veil {
   position: fixed; inset: 0; pointer-events: auto; cursor: crosshair; z-index: 2147483647;
   background: rgba(0,0,0,.25);
@@ -128,6 +130,10 @@ export class Overlay {
   private host: HTMLDivElement;
   private root: HTMLDivElement;
   private barWrap: HTMLDivElement;
+  private arrowLayer: SVGSVGElement;
+  private arrowOn = true;
+  private bestMoveUci: string | null = null;
+  private arrowWhiteAtBottom = true;
   private bar: HTMLDivElement;
   private whiteFill: HTMLDivElement;
   private scoreChip: HTMLDivElement;
@@ -152,6 +158,11 @@ export class Overlay {
     this.root = document.createElement('div');
     this.root.className = 'root';
     shadow.appendChild(this.root);
+
+    this.arrowLayer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    this.arrowLayer.classList.add('arrow-layer', 'hidden');
+    this.arrowLayer.setAttribute('viewBox', '0 0 8 8');
+    this.root.appendChild(this.arrowLayer);
 
     this.barWrap = document.createElement('div');
     this.barWrap.className = 'bar-wrap hidden';
@@ -193,6 +204,7 @@ export class Overlay {
         <button class="btn" id="btn-rescan" title="Re-scan the board">⟳ Scan</button>
         <button class="btn" id="btn-pause" title="Pause automatic analysis">⏸</button>
         <button class="btn" id="btn-side" title="Side to move">White to move</button>
+        <button class="btn active" id="btn-arrow" title="Show best move arrow on the board">➤</button>
         <button class="btn" id="btn-flip" title="Flip detected orientation">⇅</button>
         <button class="btn" id="btn-fen" title="Copy FEN">FEN</button>
         <button class="btn" id="btn-region" title="Select board region manually">⛶</button>
@@ -205,6 +217,11 @@ export class Overlay {
     this.els['btn-rescan'].addEventListener('click', () => this.cb.onRescan());
     this.els['btn-fen'].addEventListener('click', () => this.cb.onCopyFen());
     this.els['btn-flip'].addEventListener('click', () => this.cb.onFlip());
+    this.els['btn-arrow'].addEventListener('click', () => {
+      this.arrowOn = !this.arrowOn;
+      this.els['btn-arrow'].classList.toggle('active', this.arrowOn);
+      this.renderArrow();
+    });
     this.els['btn-region'].addEventListener('click', () => this.cb.onSelectRegion());
     this.els['btn-pause'].addEventListener('click', () => {
       this.paused = !this.paused;
@@ -228,6 +245,37 @@ export class Overlay {
 
   setHidden(hidden: boolean): void {
     this.host.style.visibility = hidden ? 'hidden' : '';
+  }
+
+  /** The best-move arrow lies ON the board by design, so it must be hidden
+   *  during every capture or the recognizer reads it as pieces. */
+  setArrowHidden(hidden: boolean): void {
+    // display:none (not visibility): the layer must leave the compositor
+    // entirely before captureVisibleTab grabs the next frame.
+    this.arrowLayer.style.display = hidden ? 'none' : '';
+  }
+
+  debugRects(): string {
+    const b = this.barWrap.classList.contains('hidden') ? null : this.barWrap.getBoundingClientRect();
+    const p = this.panel.classList.contains('hidden') ? null : this.panel.getBoundingClientRect();
+    return JSON.stringify({ bar: b && [b.left, b.top, b.width, b.height], panel: p && [p.left, p.top, p.width, p.height] });
+  }
+
+  /** Does any visible overlay part intersect the given viewport rect?
+   *  Used to decide whether the overlay must be hidden during a screen
+   *  capture: hiding on every automatic re-scan makes the UI flicker, so we
+   *  only hide when we would actually contaminate the board pixels. */
+  overlapsRect(rect: CssRect, margin = 2): boolean {
+    const boxes: DOMRect[] = [];
+    if (!this.barWrap.classList.contains('hidden')) boxes.push(this.barWrap.getBoundingClientRect());
+    if (!this.panel.classList.contains('hidden')) boxes.push(this.panel.getBoundingClientRect());
+    return boxes.some(
+      (b) =>
+        b.right > rect.x - margin &&
+        b.left < rect.x + rect.w + margin &&
+        b.bottom > rect.y - margin &&
+        b.top < rect.y + rect.h + margin,
+    );
   }
 
   get isPaused(): boolean {
@@ -269,6 +317,7 @@ export class Overlay {
   private position(): void {
     if (!this.boardRect) {
       this.barWrap.classList.add('hidden');
+      this.arrowLayer.classList.add('hidden');
       if (this.panelOpen) {
         this.panel.style.left = '18px';
         this.panel.style.top = '18px';
@@ -285,13 +334,51 @@ export class Overlay {
     this.barWrap.style.height = `${r.h}px`;
     this.barWrap.style.width = `${barW}px`;
 
+    Object.assign(this.arrowLayer.style, {
+      left: `${r.x}px`,
+      top: `${r.y}px`,
+      width: `${r.w}px`,
+      height: `${r.h}px`,
+    });
+    this.renderArrow();
+
+    // Panel placement: NEVER over the board when any side fits (a panel over
+    // the board would force an overlay hide on every capture -> flicker).
     const panelW = 292;
-    let px = left - panelW - 10;
-    if (px < 4) px = Math.min(r.x + r.w + barW + 16, window.innerWidth - panelW - 4);
-    if (px < 4) px = 4;
-    let py = r.y;
     const panelH = this.panel.offsetHeight || 240;
-    if (py + panelH > window.innerHeight - 8) py = Math.max(8, window.innerHeight - panelH - 8);
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const clampY = (y: number) => Math.max(8, Math.min(vh - panelH - 8, y));
+    const barOnLeft = left < r.x;
+    const candidates: [number, number][] = [
+      // Outside the bar, same side as the bar.
+      barOnLeft ? [left - panelW - 10, r.y] : [left + barW + 10, r.y],
+      // The other side of the board.
+      barOnLeft ? [r.x + r.w + 10, r.y] : [r.x - panelW - 10, r.y],
+      // Below, then above the board.
+      [r.x, r.y + r.h + 10],
+      [r.x, r.y - panelH - 10],
+    ];
+    let px = 4;
+    let py = clampY(r.y);
+    let placed = false;
+    for (const [cx, cy] of candidates) {
+      const x = Math.max(4, Math.min(vw - panelW - 4, cx));
+      const y = clampY(cy);
+      const overlapsBoard =
+        x + panelW > r.x - 4 && x < r.x + r.w + 4 && y + panelH > r.y - 4 && y < r.y + r.h + 4;
+      if (!overlapsBoard) {
+        px = x;
+        py = y;
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      // Nothing fits beside the board (tiny viewport): bottom-left corner.
+      px = 4;
+      py = clampY(vh - panelH - 8);
+    }
     this.panel.style.left = `${px}px`;
     this.panel.style.top = `${py}px`;
   }
@@ -340,50 +427,121 @@ export class Overlay {
     this.els['meta'].textContent = meta.join('  ·  ');
   }
 
-  /** Interactive drag-selection of a region; resolves with CSS-px rect. */
+  /** Show (or clear) the engine's best move as an arrow over the board.
+   *  `uci` is a long-algebraic move like "e2e4". */
+  setBestMoveArrow(uci: string | null, whiteAtBottom: boolean): void {
+    this.bestMoveUci = uci && /^[a-h][1-8][a-h][1-8]/.test(uci) ? uci : null;
+    this.arrowWhiteAtBottom = whiteAtBottom;
+    this.renderArrow();
+  }
+
+  private renderArrow(): void {
+    const show = this.arrowOn && this.bestMoveUci && this.boardRect;
+    this.arrowLayer.classList.toggle('hidden', !show);
+    this.arrowLayer.innerHTML = '';
+    if (!show) return;
+    const uci = this.bestMoveUci!;
+    const square = (file: number, rank: number): [number, number] =>
+      this.arrowWhiteAtBottom ? [file + 0.5, 7.5 - rank] : [7.5 - file, rank + 0.5];
+    const [x1, y1] = square(uci.charCodeAt(0) - 97, uci.charCodeAt(1) - 49);
+    const [x2, y2] = square(uci.charCodeAt(2) - 97, uci.charCodeAt(3) - 49);
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy);
+    if (len < 0.5) return;
+    const ux = dx / len, uy = dy / len;
+    // Shorten the tail off the source square center and leave room for the head.
+    const sx = x1 + ux * 0.32, sy = y1 + uy * 0.32;
+    const head = 0.42;
+    const ex = x2 - ux * head, ey = y2 - uy * head;
+    const px = -uy, py = ux;
+    const ns = 'http://www.w3.org/2000/svg';
+    const g = document.createElementNS(ns, 'g');
+    g.setAttribute('fill', 'rgba(21,120,27,0.85)');
+    const line = document.createElementNS(ns, 'polygon');
+    const hw = 0.11;
+    line.setAttribute(
+      'points',
+      `${sx + px * hw},${sy + py * hw} ${ex + px * hw},${ey + py * hw} ${ex - px * hw},${ey - py * hw} ${sx - px * hw},${sy - py * hw}`,
+    );
+    const tip = document.createElementNS(ns, 'polygon');
+    const bw = 0.28;
+    tip.setAttribute(
+      'points',
+      `${x2 - ux * 0.06},${y2 - uy * 0.06} ${ex + px * bw},${ey + py * bw} ${ex - px * bw},${ey - py * bw}`,
+    );
+    g.append(line, tip);
+    this.arrowLayer.appendChild(g);
+  }
+
+  /** Interactive drag-selection of a region; resolves with CSS-px rect.
+   *  Listeners live on window (capture) so a release outside the page, a
+   *  lost pointer, Esc, a second Escape-hatch click, or a 60s timeout can
+   *  never leave the full-page veil stuck blocking the site. */
   beginRegionSelection(): Promise<CssRect | null> {
     return new Promise((resolve) => {
       const veil = document.createElement('div');
       veil.className = 'select-veil';
       const hint = document.createElement('div');
       hint.className = 'select-hint';
-      hint.textContent = 'Drag a rectangle around the chessboard — Esc to cancel';
+      hint.textContent = 'Drag a rectangle around the chessboard — Esc or click to cancel';
       const rectEl = document.createElement('div');
       rectEl.className = 'select-rect hidden';
       veil.append(hint, rectEl);
       this.root.appendChild(veil);
 
-      let sx = 0, sy = 0, dragging = false;
+      let sx = 0, sy = 0, dragging = false, done = false;
+      const cleanup: (() => void)[] = [];
       const finish = (result: CssRect | null) => {
+        if (done) return;
+        done = true;
+        for (const fn of cleanup) fn();
         veil.remove();
-        window.removeEventListener('keydown', onKey, true);
         resolve(result);
       };
-      const onKey = (e: KeyboardEvent) => {
+      const on = <K extends keyof WindowEventMap>(type: K, fn: (e: WindowEventMap[K]) => void) => {
+        window.addEventListener(type, fn, true);
+        cleanup.push(() => window.removeEventListener(type, fn, true));
+      };
+
+      const timeout = setTimeout(() => finish(null), 60000);
+      cleanup.push(() => clearTimeout(timeout));
+
+      on('keydown', (e) => {
         if (e.key === 'Escape') {
           e.preventDefault();
+          e.stopPropagation();
           finish(null);
         }
-      };
-      window.addEventListener('keydown', onKey, true);
-      veil.addEventListener('mousedown', (e) => {
+      });
+      on('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         dragging = true;
         sx = e.clientX;
         sy = e.clientY;
         rectEl.classList.remove('hidden');
+        Object.assign(rectEl.style, { left: `${sx}px`, top: `${sy}px`, width: '0px', height: '0px' });
       });
-      veil.addEventListener('mousemove', (e) => {
+      on('pointermove', (e) => {
         if (!dragging) return;
         const x = Math.min(sx, e.clientX), y = Math.min(sy, e.clientY);
         const w = Math.abs(e.clientX - sx), h = Math.abs(e.clientY - sy);
         Object.assign(rectEl.style, { left: `${x}px`, top: `${y}px`, width: `${w}px`, height: `${h}px` });
       });
-      veil.addEventListener('mouseup', (e) => {
-        if (!dragging) return;
-        const x = Math.min(sx, e.clientX), y = Math.min(sy, e.clientY);
-        const w = Math.abs(e.clientX - sx), h = Math.abs(e.clientY - sy);
+      const end = (cx: number, cy: number) => {
+        if (!dragging) return finish(null);
+        const x = Math.min(sx, cx), y = Math.min(sy, cy);
+        const w = Math.abs(cx - sx), h = Math.abs(cy - sy);
+        // A tiny drag is a click: treat as cancel.
         finish(w > 40 && h > 40 ? { x, y, w, h } : null);
+      };
+      on('pointerup', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        end(e.clientX, e.clientY);
       });
+      on('pointercancel', () => finish(null));
+      on('blur', () => finish(null));
     });
   }
 }

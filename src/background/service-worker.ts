@@ -14,10 +14,6 @@ import { DEFAULT_SETTINGS } from '../messages';
 
 const OFFSCREEN_URL = 'offscreen.html';
 
-/** Tab that owns the current analysis (engine updates are routed to it). */
-let analysisTabId: number | null = null;
-let requestCounter = 1;
-
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.id || !tab.url) return;
   if (!/^https?:|^file:/.test(tab.url)) return;
@@ -80,19 +76,22 @@ chrome.runtime.onMessage.addListener(
       }
 
       case 'analyze': {
-        if (sender.tab?.id === undefined) return;
-        analysisTabId = sender.tab.id;
-        const requestId = requestCounter++;
+        // No state may live in this service worker (it is torn down between
+        // events): the request id comes from the content script and the tab
+        // id rides along inside every engine message.
+        const tabId = sender.tab?.id;
+        if (tabId === undefined) return;
         ensureOffscreen()
           .then(() =>
             chrome.runtime.sendMessage({
               type: 'engine-analyze',
               fen: message.fen,
               options: message.options,
-              requestId,
+              requestId: message.requestId,
+              tabId,
             } satisfies BackgroundToOffscreen),
           )
-          .then(() => sendResponse({ ok: true, requestId }))
+          .then(() => sendResponse({ ok: true }))
           .catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
         return true;
       }
@@ -118,10 +117,10 @@ chrome.runtime.onMessage.addListener(
       }
 
       case 'engine-update': {
-        // From offscreen -> forward to the analysis tab.
-        if (analysisTabId !== null) {
+        // From offscreen -> forward to the tab named inside the update.
+        if (typeof message.update?.tabId === 'number') {
           chrome.tabs
-            .sendMessage(analysisTabId, { type: 'engine-update', update: message.update })
+            .sendMessage(message.update.tabId, { type: 'engine-update', update: message.update })
             .catch(() => {});
         }
         return;

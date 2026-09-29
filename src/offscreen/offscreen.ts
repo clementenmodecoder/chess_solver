@@ -14,6 +14,7 @@ let engineName = 'Stockfish';
 
 interface ActiveSearch {
   requestId: number;
+  tabId: number;
   sideToMove: 'w' | 'b';
   lines: Map<number, UciInfoLine>;
   lastSent: number;
@@ -30,6 +31,7 @@ function postUpdate(done: boolean, bestMove?: string, error?: string): void {
   if (!active) return;
   const update: EngineUpdate = {
     requestId: active.requestId,
+    tabId: active.tabId,
     lines: [...active.lines.values()].sort((a, b) => a.multipv - b.multipv),
     bestMove,
     engineName,
@@ -105,13 +107,13 @@ function onEngineLine(e: MessageEvent): void {
   }
 }
 
-async function analyze(fen: string, options: EngineOptions, requestId: number): Promise<void> {
+async function analyze(fen: string, options: EngineOptions, requestId: number, tabId: number): Promise<void> {
   await initEngine();
   // Abort any running search; its bestmove will arrive for the OLD requestId
   // and be dropped because we swap `active` first.
   send('stop');
   const sideToMove = fen.split(' ')[1] === 'b' ? 'b' : 'w';
-  active = { requestId, sideToMove, lines: new Map(), lastSent: 0, timer: null };
+  active = { requestId, tabId, sideToMove, lines: new Map(), lastSent: 0, timer: null };
   if (options.multiPv !== currentMultiPv) {
     currentMultiPv = options.multiPv;
     send(`setoption name MultiPV value ${options.multiPv}`);
@@ -162,8 +164,8 @@ async function recognizeBoard(dataUrl: string): Promise<VisionResult> {
 chrome.runtime.onMessage.addListener(
   (message: BackgroundToOffscreen, _sender, sendResponse: (r: VisionResult) => void) => {
     if (message.type === 'engine-analyze') {
-      analyze(message.fen, message.options, message.requestId).catch((err) => {
-        active = { requestId: message.requestId, sideToMove: 'w', lines: new Map(), lastSent: 0, timer: null };
+      analyze(message.fen, message.options, message.requestId, message.tabId).catch((err) => {
+        active = { requestId: message.requestId, tabId: message.tabId, sideToMove: 'w', lines: new Map(), lastSent: 0, timer: null };
         postUpdate(true, undefined, String(err?.message ?? err));
         active = null;
       });

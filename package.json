@@ -1,0 +1,29 @@
+{
+  "name": "chess-lens",
+  "version": "0.1.0",
+  "description": "Chrome extension that visually recognizes a chessboard on screen and analyzes the position with Stockfish (WASM)",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "gen:templates": "node scripts/gen-templates.mjs",
+    "gen:fixtures": "node scripts/gen-fixtures.mjs",
+    "gen:icons": "node scripts/gen-icons.mjs",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@types/chrome": "^0.0.268",
+    "esbuild": "^0.25.0",
+    "pngjs": "^7.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "chess.js": "^1.0.0",
+    "stockfish": "^19.0.0"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "weights": {
+    "med": 4.80723,
+    "q20": 0.54268,
+    "q80": 4.69232,
+    "fracBright": 8.31911,
+    "fracDark": -5.23726,
+    "outlineDark": 1.03044,
+    "brightPatch": 3.45615,
+    "texture": 2.22811
+  },
+  "bias": -7.68414
+}

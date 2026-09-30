@@ -27,6 +27,18 @@ if (!existsSync(resolve(fixtureDir, 'index.json'))) {
 
 const fixtures = JSON.parse(readFileSync(resolve(fixtureDir, 'index.json'), 'utf8'));
 
+// Extra fixture for the watch/side-inference scenario: the start position
+// after 1.e4, same set/theme/size as cburnett-start-brown-256.
+{
+  const { renderBoard } = await import('../../scripts/lib/boardgen.mjs');
+  const { writePng } = await import('../../scripts/lib/util.mjs');
+  const { img } = renderBoard({
+    placement: 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR',
+    set: 'cburnett', theme: 'brown', boardSize: 256, whiteAtBottom: true,
+  });
+  writePng(resolve(fixtureDir, 'e2e-after-e4.png'), img);
+}
+
 // --- Tiny static server for the test pages ----------------------------------
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
@@ -225,6 +237,28 @@ try {
       after.fen === before.fen,
       'position unchanged across rescans',
     );
+    await page.close();
+  }
+
+  // ---- Scenario 3d: watch mode follows a move and infers side to move --------
+  {
+    const page = await context.newPage();
+    await page.goto(`${base}/board?img=cburnett-start-brown-256.png&size=512`);
+    await page.bringToFront();
+    await inject(page);
+    await waitDebug(page, (dbg) => dbg?.fen != null, 30000);
+    const before = await readDebug(page);
+    check(before.fen.includes(' w '), `initial position is white to move (${before.fen})`);
+    // The page plays 1.e4: swap the board image; the MutationObserver on the
+    // <img> must trigger a rescan, and the one-legal-move transition must
+    // flip the side to move to black.
+    await page.evaluate(() => {
+      document.getElementById('board').src = '/fixture/e2e-after-e4.png';
+    });
+    await waitDebug(page, (dbg) => dbg?.fen?.includes('4P3') ?? false, 20000);
+    const after = await readDebug(page);
+    check(after.fen.includes('4P3'), `watch mode picked up the played move (${after.fen})`);
+    check(after.fen.includes(' b '), `side to move inferred as black (${after.fen})`);
     await page.close();
   }
 

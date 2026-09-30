@@ -36,10 +36,4 @@ for (let i = 0; i < 3; i++) {
   await page.waitForTimeout(900);
 }
 console.log('final:', await page.evaluate(() => document.documentElement.dataset.chessLensDebug));
-const cropData = await page.evaluate(() => document.documentElement.dataset.chessLensLastCrop ?? '');
-if (cropData.startsWith('data:image')) {
-  const { writeFileSync } = await import('node:fs');
-  writeFileSync('/tmp/lastcrop.png', Buffer.from(cropData.split(',')[1], 'base64'));
-  console.log('crop saved /tmp/lastcrop.png');
-}
 await context.close(); server.close();

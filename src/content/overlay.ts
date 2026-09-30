@@ -255,12 +255,6 @@ export class Overlay {
     this.arrowLayer.style.display = hidden ? 'none' : '';
   }
 
-  debugRects(): string {
-    const b = this.barWrap.classList.contains('hidden') ? null : this.barWrap.getBoundingClientRect();
-    const p = this.panel.classList.contains('hidden') ? null : this.panel.getBoundingClientRect();
-    return JSON.stringify({ bar: b && [b.left, b.top, b.width, b.height], panel: p && [p.left, p.top, p.width, p.height] });
-  }
-
   /** Does any visible overlay part intersect the given viewport rect?
    *  Used to decide whether the overlay must be hidden during a screen
    *  capture: hiding on every automatic re-scan makes the UI flicker, so we

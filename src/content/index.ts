@@ -21,6 +21,7 @@ import type { BackgroundToContent, CaptureResponse, EngineUpdate, Settings, Visi
 import { DEFAULT_SETTINGS } from '../messages';
 import { Overlay, type CssRect } from './overlay';
 import { detectPlayContext } from './safety';
+import { inferSideAfterTransition } from '../chess/transition';
 
 declare global {
   interface Window {
@@ -91,6 +92,8 @@ class ChessLens {
   private watchTimer: number | null = null;
   private observer: MutationObserver | null = null;
   private messageListener: ((message: BackgroundToContent) => void) | null = null;
+  private debugListener: ((e: Event) => void) | null = null;
+  private blocked = false;
   private lastSafeAt = 0;
   private learned: LearnedStore = {};
   private learnedLoaded = false;
@@ -143,12 +146,13 @@ class ChessLens {
 
     // Debug/E2E hooks: allow the page to trigger UI commands that live
     // inside the closed shadow root (used by the automated test-suite).
-    document.addEventListener('chess-lens-debug', (e: Event) => {
+    this.debugListener = (e: Event) => {
       if (this.destroyed) return;
       const cmd = (e as CustomEvent).detail;
       if (cmd === 'rescan') this.scan(true);
       else if (cmd === 'select-region') this.selectRegion();
-    });
+    };
+    document.addEventListener('chess-lens-debug', this.debugListener);
 
     const reposition = () => {
       cancelAnimationFrame(this.repositionRaf);
@@ -180,6 +184,7 @@ class ChessLens {
     this.destroyed = true;
     this.stopWatching();
     if (this.messageListener) chrome.runtime.onMessage.removeListener(this.messageListener);
+    if (this.debugListener) document.removeEventListener('chess-lens-debug', this.debugListener);
     chrome.runtime.sendMessage({ type: 'stop-analysis' }).catch(() => {});
     this.overlay.destroy();
   }
@@ -308,6 +313,11 @@ class ChessLens {
       this.overlay.setStatus('error', `Scan failed: ${String((err as Error)?.message ?? err)}`);
     } finally {
       this.scanning = false;
+      // Keep watching even when a scan failed or found no board (the board
+      // may scroll back into view); only a live-play block stops the watch.
+      if (!this.destroyed && !this.blocked && !this.observer && this.watchTimer === null) {
+        this.startWatching();
+      }
       if (this.scanQueued && !this.destroyed) {
         setTimeout(() => this.scan(false), 250);
       }
@@ -325,6 +335,7 @@ class ChessLens {
       if (context === 'safe') this.lastSafeAt = Date.now();
     }
     if (context === 'live-play') {
+      this.blocked = true;
       this.stopWatching();
       chrome.runtime.sendMessage({ type: 'stop-analysis' }).catch(() => {});
       updateDebug({ status: 'blocked' });
@@ -335,6 +346,7 @@ class ChessLens {
       return;
     }
 
+    this.blocked = false;
     updateDebug({ scanCount: (window.__chessLensDebug?.scanCount ?? 0) + 1 });
     const captured = await this.captureViewport();
     if (!captured) return;
@@ -475,13 +487,22 @@ class ChessLens {
       return;
     }
     this.unchangedStreak = 0;
-    this.lastFen = fen;
-    this.lastPlacementSide = placementSide;
-    updateDebug({ fen, status: 'analyzing', whiteAtBottom: this.whiteAtBottom, error: null });
+    // A position change caused by one legal move reveals the side to move.
+    if (this.lastFen) {
+      const inferred = inferSideAfterTransition(this.lastFen, placementSide);
+      if (inferred && inferred !== this.sideToMove) {
+        this.sideToMove = inferred;
+        this.overlay.setSide(inferred);
+      }
+    }
+    const finalFen = buildFen(oriented, this.sideToMove);
+    this.lastFen = finalFen;
+    this.lastPlacementSide = finalFen.split(' ').slice(0, 2).join(' ');
+    updateDebug({ fen: this.lastFen, status: 'analyzing', whiteAtBottom: this.whiteAtBottom, error: null });
 
     this.overlay.setBestMoveArrow(null, this.whiteAtBottom);
     this.overlay.setStatus('analyzing', notes.length ? notes.join(' ') : undefined);
-    await this.requestAnalysis(fen);
+    await this.requestAnalysis(this.lastFen);
     this.startWatching();
   }
 
@@ -511,6 +532,7 @@ class ChessLens {
     parts[1] = this.sideToMove;
     this.lastFen = parts.join(' ');
     this.lastPlacementSide = parts.slice(0, 2).join(' ');
+    updateDebug({ fen: this.lastFen, status: 'analyzing' });
     this.overlay.setStatus('analyzing');
     this.requestAnalysis(this.lastFen);
   }
@@ -640,7 +662,15 @@ class ChessLens {
 
   private async selectRegion(): Promise<void> {
     const rect = await this.overlay.beginRegionSelection();
-    if (!rect) return;
+    if (!rect) {
+      // Cancelled: if a manual region was active, drop it and go back to
+      // automatic detection (the intuitive way to leave manual mode).
+      if (this.source.manualRect) {
+        this.source.manualRect = null;
+        await this.scan(true);
+      }
+      return;
+    }
     this.source.manualRect = rect;
     this.source.element = null;
     await this.scan(true);

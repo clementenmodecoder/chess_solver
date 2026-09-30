@@ -28,16 +28,32 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 });
 
+// Per-service-worker-lifetime creation lock: concurrent callers (analyze +
+// vision-recognize on startup) must not both call createDocument, which
+// throws "Only a single offscreen document may be created".
+let offscreenCreation: Promise<void> | null = null;
+
 async function ensureOffscreen(): Promise<void> {
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ['OFFSCREEN_DOCUMENT' as chrome.runtime.ContextType],
   });
   if (contexts.length > 0) return;
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_URL,
-    reasons: ['WORKERS' as chrome.offscreen.Reason],
-    justification: 'Runs the Stockfish WASM chess engine in a Web Worker',
-  });
+  if (!offscreenCreation) {
+    offscreenCreation = chrome.offscreen
+      .createDocument({
+        url: OFFSCREEN_URL,
+        reasons: ['WORKERS' as chrome.offscreen.Reason],
+        justification: 'Runs the Stockfish WASM chess engine and the board recognition model in Web Workers',
+      })
+      .catch((err) => {
+        // Lost a race against another service-worker lifetime: fine.
+        if (!String(err?.message ?? err).includes('single offscreen')) throw err;
+      })
+      .finally(() => {
+        offscreenCreation = null;
+      });
+  }
+  await offscreenCreation;
 }
 
 export async function getSettings(): Promise<Settings> {

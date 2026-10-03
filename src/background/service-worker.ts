@@ -118,6 +118,7 @@ chrome.runtime.onMessage.addListener(
             chrome.runtime.sendMessage({
               type: 'offscreen-vision-recognize',
               dataUrl: message.dataUrl,
+              exactBoard: message.exactBoard,
             } satisfies BackgroundToOffscreen),
           )
           .then((result) => sendResponse(result))

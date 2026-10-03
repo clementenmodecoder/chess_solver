@@ -5,7 +5,7 @@
 import { Chess } from 'chess.js';
 import type { RGBAImage, Rect } from '../vision/types';
 import { detectBoard, snapGrid } from '../vision/detect';
-import { classifyBoard } from '../vision/classify';
+import { classifyBoard, reconcileKingQueen } from '../vision/classify';
 import { loadTemplates } from '../vision/templates';
 import { harvestIntoStore, learnedToTemplates, HARVEST_MIN_CONFIDENCE, type LearnedStore } from '../vision/learning';
 import { crop } from '../vision/image';
@@ -13,6 +13,7 @@ import {
   buildFen,
   decideOrientation,
   orientMatrix,
+  placementFromMatrix,
   placementToMatrix,
   validatePosition,
 } from '../chess/fen';
@@ -21,7 +22,7 @@ import type { BackgroundToContent, CaptureResponse, EngineUpdate, Settings, Visi
 import { DEFAULT_SETTINGS } from '../messages';
 import { Overlay, type CssRect } from './overlay';
 import { detectPlayContext } from './safety';
-import { inferSideAfterTransition } from '../chess/transition';
+import { inferSideFromHistory } from '../chess/transition';
 
 declare global {
   interface Window {
@@ -37,6 +38,12 @@ declare global {
       whiteAtBottom: boolean;
       error: string | null;
       recognizer?: 'cnn' | 'classic';
+      /** Raw recognition before validation (screen orientation, ranks top->bottom). */
+      rawPlacement?: string;
+      cnnReliable?: boolean;
+      cnnMinConfidence?: number;
+      cnnPlacement?: string;
+      boardRect?: { x: number; y: number; w: number; h: number } | null;
       /** How many times the overlay was hidden for a capture (flicker probe). */
       hideCount?: number;
       scanCount?: number;
@@ -82,6 +89,8 @@ class ChessLens {
   private source: BoardSource = { element: null, cssRect: null, manualRect: null };
   private lastFen: string | null = null;
   private lastPlacementSide: string | null = null;
+  /** Recent analyzed FENs (oldest first) for side-to-move inference. */
+  private fenHistory: string[] = [];
   private sideToMove: 'w' | 'b' = 'w';
   private whiteAtBottom = true;
   private orientationFlipped = false;
@@ -248,9 +257,9 @@ class ChessLens {
   }
 
   /** Ask the offscreen CNN recognizer (fenshot) to read a board image. */
-  private async cnnRecognize(dataUrl: string): Promise<VisionResult | null> {
+  private async cnnRecognize(dataUrl: string, exactBoard: boolean): Promise<VisionResult | null> {
     try {
-      const result: VisionResult = await chrome.runtime.sendMessage({ type: 'vision-recognize', dataUrl });
+      const result: VisionResult = await chrome.runtime.sendMessage({ type: 'vision-recognize', dataUrl, exactBoard });
       return result?.ok ? result : null;
     } catch {
       return null;
@@ -393,7 +402,9 @@ class ChessLens {
     let recognizerUsed: 'cnn' | 'classic' = 'cnn';
     const vision = await this.cnnRecognize(
       rect ? await this.imageToDataUrl(crop(img, rect)) : captured.dataUrl,
+      rect !== null,
     );
+    updateDebug({ cnnReliable: vision?.reliable ?? false, cnnMinConfidence: vision?.minConfidence, cnnPlacement: vision?.placement });
     if (vision?.reliable && vision.placement) {
       try {
         // fenshot reads as if White were at the bottom of the image; its
@@ -445,10 +456,20 @@ class ChessLens {
       const boardImg = crop(img, rect);
       const templates = [...loadTemplates(), ...learnedToTemplates(this.learned)];
       classicRec = classifyBoard(boardImg, templates);
+      // The CNN's read, even when unreliable overall, is a good tiebreaker
+      // for the K/Q crown confusion of silhouette matching.
+      if (vision?.placement) {
+        try {
+          reconcileKingQueen(classicRec, placementToMatrix(vision.placement));
+        } catch {
+          /* malformed CNN placement: ignore */
+        }
+      }
       screenMatrix = classicRec.board;
       confidence = classicRec.confidence;
     }
 
+    updateDebug({ recognizer: recognizerUsed, rawPlacement: placementFromMatrix(screenMatrix), boardRect: rect });
     const auto = decideOrientation(screenMatrix);
     this.whiteAtBottom = this.orientationFlipped ? !auto.whiteAtBottom : auto.whiteAtBottom;
     const oriented = orientMatrix(screenMatrix, this.whiteAtBottom);
@@ -488,15 +509,21 @@ class ChessLens {
     }
     this.unchangedStreak = 0;
     // A position change caused by one legal move reveals the side to move.
-    if (this.lastFen) {
-      const inferred = inferSideAfterTransition(this.lastFen, placementSide);
+    if (this.fenHistory.length) {
+      const inferred = inferSideFromHistory(this.fenHistory, placementSide);
       if (inferred && inferred !== this.sideToMove) {
         this.sideToMove = inferred;
         this.overlay.setSide(inferred);
       }
     }
     const finalFen = buildFen(oriented, this.sideToMove);
+    // Invalidate the running request right away: an update from the old
+    // search arriving before the new request id exists would otherwise be
+    // SAN-converted against the new position (and shown as raw UCI).
+    this.currentRequestId = -1;
     this.lastFen = finalFen;
+    this.fenHistory.push(finalFen);
+    if (this.fenHistory.length > 4) this.fenHistory.shift();
     this.lastPlacementSide = finalFen.split(' ').slice(0, 2).join(' ');
     updateDebug({ fen: this.lastFen, status: 'analyzing', whiteAtBottom: this.whiteAtBottom, error: null });
 
@@ -531,6 +558,7 @@ class ChessLens {
     const parts = this.lastFen.split(' ');
     parts[1] = this.sideToMove;
     this.lastFen = parts.join(' ');
+    if (this.fenHistory.length) this.fenHistory[this.fenHistory.length - 1] = this.lastFen;
     this.lastPlacementSide = parts.slice(0, 2).join(' ');
     updateDebug({ fen: this.lastFen, status: 'analyzing' });
     this.overlay.setStatus('analyzing');

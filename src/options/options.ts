@@ -19,9 +19,9 @@ function save(): void {
       depth: clamp(parseInt($('depth').value, 10) || 0, 0, 40),
       movetimeMs: clamp(parseInt($('movetime').value, 10) || 0, 0, 120000),
       multiPv: clamp(parseInt($('multipv').value, 10) || 1, 1, 3),
+      elo: $('elo').value === 'full' ? 0 : clamp(parseInt($('elo').value, 10) || 0, 1320, 3190),
     },
     watchBoard: $('watch').checked,
-    elo: 0,
   };
   if (settings.engine.depth === 0 && settings.engine.movetimeMs === 0) {
     settings.engine.movetimeMs = 5000;
@@ -44,7 +44,8 @@ load().then((s) => {
   $('movetime').value = String(s.engine.movetimeMs);
   $('multipv').value = String(s.engine.multiPv);
   $('watch').checked = s.watchBoard;
-  for (const id of ['depth', 'movetime', 'multipv', 'watch']) {
+  $('elo').value = s.engine.elo > 0 ? String(s.engine.elo) : 'full';
+  for (const id of ['depth', 'movetime', 'multipv', 'watch', 'elo']) {
     $(id).addEventListener('change', save);
   }
 });

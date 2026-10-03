@@ -11,6 +11,8 @@ const LIVE_URL_PATTERNS: RegExp[] = [
   /^https?:\/\/(?:www\.)?chess\.com\/game\/live(?:\/|$)/,
   /^https?:\/\/(?:www\.)?chess\.com\/play\/online(?:\/|$)/,
   /^https?:\/\/(?:www\.)?chess\.com\/live(?:\/|$)/,
+  /^https?:\/\/(?:www\.)?chess\.com\/game\/daily(?:\/|$)/,
+  /^https?:\/\/(?:www\.)?chess\.com\/daily(?:\/|$)/,
   /^https?:\/\/play\.chess\.com\//,
   /^https?:\/\/(?:www\.)?chess24\.com\/.*\/play\//,
 ];

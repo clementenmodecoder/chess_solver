@@ -9,20 +9,19 @@ export interface EngineOptions {
   /** Search time budget in ms (0 = unlimited, use depth). */
   movetimeMs: number;
   multiPv: number;
+  /** Engine strength cap in Elo (0 = full strength). */
+  elo: number;
 }
 
 export interface Settings {
   engine: EngineOptions;
   /** Re-scan automatically when the page board changes. */
   watchBoard: boolean;
-  /** Skill: cap engine strength (0 = full). */
-  elo: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  engine: { depth: 20, movetimeMs: 6000, multiPv: 3 },
+  engine: { depth: 20, movetimeMs: 6000, multiPv: 3, elo: 0 },
   watchBoard: true,
-  elo: 0,
 };
 
 /** content -> background */
@@ -32,7 +31,7 @@ export type ContentToBackground =
   | { type: 'stop-analysis' }
   | { type: 'open-options' }
   | { type: 'get-settings' }
-  | { type: 'vision-recognize'; dataUrl: string };
+  | { type: 'vision-recognize'; dataUrl: string; exactBoard: boolean };
 
 /** CNN board recognition result (fenshot), relayed from the offscreen host. */
 export interface VisionResult {
@@ -59,7 +58,7 @@ export type BackgroundToContent =
 export type BackgroundToOffscreen =
   | { type: 'engine-analyze'; fen: string; options: EngineOptions; requestId: number; tabId: number }
   | { type: 'engine-stop' }
-  | { type: 'offscreen-vision-recognize'; dataUrl: string };
+  | { type: 'offscreen-vision-recognize'; dataUrl: string; exactBoard: boolean };
 
 export interface EngineUpdate {
   requestId: number;

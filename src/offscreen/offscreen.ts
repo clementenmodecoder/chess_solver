@@ -4,7 +4,18 @@
 
 import type { BackgroundToOffscreen, EngineOptions, EngineUpdate, OffscreenToBackground, VisionResult } from '../messages';
 import { parseBestMove, parseInfoLine, type UciInfoLine } from '../engine/uci';
-import { createRecognizer, type Recognizer } from '@scoriiu/fenshot';
+import {
+  CONFIDENCE_FLOOR,
+  extractTiles,
+  probsToPlacement,
+  recognizeGray,
+  rgbaToGray,
+  snapCorners,
+  type BoardCorners,
+  type GrayImage,
+  type RecognitionResult,
+} from '@scoriiu/fenshot';
+import * as ort from 'onnxruntime-web/wasm';
 
 const ENGINE_URL = 'engine/stockfish-19-lite-single.js';
 
@@ -22,6 +33,7 @@ interface ActiveSearch {
 }
 let active: ActiveSearch | null = null;
 let currentMultiPv = 1;
+let currentElo = 0;
 
 function send(cmd: string): void {
   worker?.postMessage(cmd);
@@ -118,6 +130,15 @@ async function analyze(fen: string, options: EngineOptions, requestId: number, t
     currentMultiPv = options.multiPv;
     send(`setoption name MultiPV value ${options.multiPv}`);
   }
+  if ((options.elo ?? 0) !== currentElo) {
+    currentElo = options.elo ?? 0;
+    if (currentElo > 0) {
+      send('setoption name UCI_LimitStrength value true');
+      send(`setoption name UCI_Elo value ${Math.max(1320, Math.min(3190, currentElo))}`);
+    } else {
+      send('setoption name UCI_LimitStrength value false');
+    }
+  }
   send(`position fen ${fen}`);
   const parts: string[] = [];
   if (options.depth > 0) parts.push(`depth ${options.depth}`);
@@ -126,27 +147,77 @@ async function analyze(fen: string, options: EngineOptions, requestId: number, t
 }
 
 // --- CNN board recognition (fenshot + onnxruntime-web) -----------------------
+// fenshot's tile classifier is used through its building blocks rather than
+// its all-in-one recognizer: when the content script already localized the
+// board, the crop IS the board and must be classified as such (fenshot's own
+// gradient-peak locator can lock a quarter tile off on textured themes).
+// Without a known board, fenshot's locator scans the whole viewport.
 
-let recognizer: Recognizer | null = null;
+let sessionPromise: Promise<ort.InferenceSession> | null = null;
 
-function getRecognizer(): Recognizer {
-  if (!recognizer) {
-    recognizer = createRecognizer({
-      modelUrl: chrome.runtime.getURL('vision/chess-tiles-v2.onnx'),
-      wasmPaths: {
-        mjs: chrome.runtime.getURL('vision/ort-wasm-simd-threaded.mjs'),
-        wasm: chrome.runtime.getURL('vision/ort-wasm-simd-threaded.wasm'),
-      },
+function getSession(): Promise<ort.InferenceSession> {
+  if (!sessionPromise) {
+    ort.env.wasm.wasmPaths = {
+      mjs: chrome.runtime.getURL('vision/ort-wasm-simd-threaded.mjs'),
+      wasm: chrome.runtime.getURL('vision/ort-wasm-simd-threaded.wasm'),
+    };
+    sessionPromise = ort.InferenceSession.create(chrome.runtime.getURL('vision/chess-tiles-v2.onnx'), {
+      executionProviders: ['wasm'],
     });
-    recognizer.warmUp();
+    sessionPromise.catch(() => {
+      sessionPromise = null;
+    });
   }
-  return recognizer;
+  return sessionPromise;
 }
 
-async function recognizeBoard(dataUrl: string): Promise<VisionResult> {
+async function classifyTiles(gray: GrayImage, corners: BoardCorners): Promise<RecognitionResult> {
+  const session = await getSession();
+  const tiles = extractTiles(gray, corners);
+  const out = await session.run({ tiles: new ort.Tensor('float32', tiles, [64, 1024]) });
+  return probsToPlacement(out['probs'].data as Float32Array);
+}
+
+async function dataUrlToGray(dataUrl: string): Promise<GrayImage> {
+  const blob = await (await fetch(dataUrl)).blob();
+  const bitmap = await createImageBitmap(blob);
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  ctx.drawImage(bitmap, 0, 0);
+  const data = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+  bitmap.close();
+  return rgbaToGray(data.data, data.width, data.height);
+}
+
+async function recognizeBoard(dataUrl: string, exactBoard: boolean): Promise<VisionResult> {
   try {
-    const blob = await (await fetch(dataUrl)).blob();
-    const result = await getRecognizer().recognize(blob);
+    const gray = await dataUrlToGray(dataUrl);
+    if (exactBoard) {
+      // The image is the board. Classify it as-is, and also let fenshot's
+      // checkerboard snap propose a sub-tile realignment; keep the read the
+      // classifier is more confident about (same arbitration fenshot uses).
+      const whole: BoardCorners = { x0: 0, y0: 0, x1: gray.width, y1: gray.height };
+      let best = await classifyTiles(gray, whole);
+      let corners = whole;
+      const snapped = snapCorners(gray, whole);
+      const moved = Math.abs(snapped.x0) + Math.abs(snapped.y0) + Math.abs(snapped.x1 - gray.width) + Math.abs(snapped.y1 - gray.height);
+      if (moved > 0.5 && moved < gray.width * 0.1) {
+        const alt = await classifyTiles(gray, snapped);
+        if (alt.meanConfidence > best.meanConfidence) {
+          best = alt;
+          corners = snapped;
+        }
+      }
+      return {
+        ok: true,
+        placement: best.placement,
+        minConfidence: best.minConfidence,
+        meanConfidence: best.meanConfidence,
+        reliable: best.minConfidence >= CONFIDENCE_FLOOR,
+        corners,
+      };
+    }
+    const result = await recognizeGray(gray, (c) => classifyTiles(gray, c));
     if (!result) return { ok: true, reliable: false };
     return {
       ok: true,
@@ -172,12 +243,12 @@ chrome.runtime.onMessage.addListener(
     } else if (message.type === 'engine-stop') {
       send('stop');
     } else if (message.type === 'offscreen-vision-recognize') {
-      recognizeBoard(message.dataUrl).then(sendResponse);
+      recognizeBoard(message.dataUrl, message.exactBoard === true).then(sendResponse);
       return true;
     }
   },
 );
 
-// Warm the recognizer as soon as the offscreen document exists: the first
-// scan is usually requested within a second of creation.
-getRecognizer();
+// Warm the model as soon as the offscreen document exists: the first scan is
+// usually requested within a second of creation.
+getSession().catch(() => undefined);

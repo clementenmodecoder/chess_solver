@@ -286,6 +286,14 @@ export function snapGrid(img: RGBAImage, rect: Rect): Rect {
   return { x: xFit.offset, y: yFit.offset, w: xFit.cell * 8, h: yFit.cell * 8 };
 }
 
+/** Force a near-square rect to an exact square around its center (boards are
+ *  square; a 0.3% aspect error puts the far rows a full pixel off). */
+export function squarify(rect: Rect): Rect {
+  if (Math.abs(rect.w - rect.h) > Math.max(rect.w, rect.h) * 0.02) return rect;
+  const s = (rect.w + rect.h) / 2;
+  return { x: rect.x + (rect.w - s) / 2, y: rect.y + (rect.h - s) / 2, w: s, h: s };
+}
+
 /** Score a DOM-proposed rect; returns refined rect or null if it does not look
  *  like a chessboard. */
 export function verifyCandidate(img: RGBAImage, rect: Rect): DetectedBoard | null {
@@ -297,7 +305,9 @@ export function verifyCandidate(img: RGBAImage, rect: Rect): DetectedBoard | nul
   };
   if (clamped.w < 48 || clamped.h < 48) return null;
   const coarse = refineRect(img, clamped);
-  const aligned = snapGrid(img, refineGridAlignment(img, coarse.rect));
+  // Enforce the square aspect a chessboard always has: a 0.3% aspect error
+  // from soft, textured square edges puts the far rows a full pixel off.
+  const aligned = squarify(snapGrid(img, refineGridAlignment(img, coarse.rect)));
   const { score, contrast } = checkerScore(img, aligned);
   if (score < MIN_CHECKER_SCORE || contrast < MIN_CHECKER_CONTRAST) return null;
   return { rect: aligned, score };

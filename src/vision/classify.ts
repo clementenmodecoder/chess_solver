@@ -26,6 +26,8 @@ const MIN_BBOX_DENSITY = 0.16;
 const CANONICAL_CELL = 64; // large boards are downsampled to this cell size // mask mass / bbox area: rejects thin texture streaks
 const MIN_TYPE_SCORE = 0.45; // below this the cell is flagged low-confidence
 const MIN_PIECE_SCORE = 0.4; // below this a foreground blob is not a piece
+const RELATIVE_COLOR_MIN_GAP = 35; // luminance gap (0..255) between the two armies' clusters
+const RELATIVE_COLOR_MAX_OVERRIDE = 4; // |whiteness| below which the per-board clustering may override
 
 /** Normalized luminance/texture statistics of a piece, input to the color
  *  model. All values are scale-invariant (fractions or 0..1 luminances). */
@@ -551,6 +553,59 @@ export function classifyBoard(boardImg: RGBAImage, templates?: PieceTemplate[]):
     cells.push(cellRow);
   }
 
+  // --- Relative color pass ---------------------------------------------------
+  // The absolute whiteness model is trained on conventional light/dark piece
+  // sets. Themed sets (e.g. two shades of green) can push a few borderline
+  // pieces across its decision boundary. Within one board, however, the two
+  // armies always form two luminance clusters: split the occupied cells in
+  // two (1-D 2-means on fill luminance) and, when the clusters are clearly
+  // separated, move weakly-decided pieces to the cluster they belong to.
+  {
+    const occupied: { r: number; c: number; lum: number; w: number }[] = [];
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const a = analyses[r][c];
+        if (board[r][c] && a.features) occupied.push({ r, c, lum: a.medianLum, w: whitenessScore(a.features) });
+      }
+    }
+    if (occupied.length >= 4) {
+      const lums = occupied.map((o) => o.lum).sort((a, b) => a - b);
+      let lo = lums[0], hi = lums[lums.length - 1];
+      for (let iter = 0; iter < 10; iter++) {
+        let sLo = 0, nLo = 0, sHi = 0, nHi = 0;
+        for (const l of lums) {
+          if (Math.abs(l - lo) <= Math.abs(l - hi)) { sLo += l; nLo++; } else { sHi += l; nHi++; }
+        }
+        const nLo2 = nLo ? sLo / nLo : lo, nHi2 = nHi ? sHi / nHi : hi;
+        if (nLo2 === lo && nHi2 === hi) break;
+        lo = nLo2; hi = nHi2;
+      }
+      // Which cluster is white: the one the absolute model finds whiter on average.
+      let wLo = 0, nLo = 0, wHi = 0, nHi = 0;
+      for (const o of occupied) {
+        if (Math.abs(o.lum - lo) <= Math.abs(o.lum - hi)) { wLo += o.w; nLo++; } else { wHi += o.w; nHi++; }
+      }
+      const hiIsWhite = nHi && nLo ? wHi / nHi >= wLo / nLo : true;
+      if (hi - lo >= RELATIVE_COLOR_MIN_GAP && nLo > 0 && nHi > 0) {
+        for (const o of occupied) {
+          // Only pieces clearly inside one cluster may override the model;
+          // anything near the midpoint is left to the absolute decision.
+          const t = (o.lum - lo) / (hi - lo);
+          if (t > 0.3 && t < 0.7) continue;
+          const inHi = t >= 0.7;
+          const relWhite = inHi ? hiIsWhite : !hiIsWhite;
+          const code = board[o.r][o.c]!;
+          const absWhite = code === code.toUpperCase();
+          if (relWhite !== absWhite && Math.abs(o.w) < RELATIVE_COLOR_MAX_OVERRIDE) {
+            const fixed = (relWhite ? code.toUpperCase() : code.toLowerCase()) as PieceCode;
+            board[o.r][o.c] = fixed;
+            cells[o.r][o.c].piece = fixed;
+          }
+        }
+      }
+    }
+  }
+
   // --- Coherence pass: at most one king per color ---------------------------
   // K/Q crowns are the most template-confusable pair; when several squares of
   // one color claim a king, keep the most king-like and demote the others to
@@ -674,6 +729,53 @@ export function classifyBoard(boardImg: RGBAImage, templates?: PieceTemplate[]):
     }
   }
 
+  // --- Coherence pass: promotion budget --------------------------------------
+  // A color can only own extra queens/rooks/bishops/knights through
+  // promotion, and each promotion costs a pawn. With `pawns` pawns still on
+  // the board, at most (8 - pawns) pieces may exceed the initial counts.
+  // Queens are the usual victims (R/B crowns read as Q): demote the
+  // weakest-margin surplus claims to their best alternative type.
+  for (const white of [true, false]) {
+    const countOf = (p: PieceType): number => {
+      const c2 = (white ? p : p.toLowerCase()) as PieceCode;
+      let n = 0;
+      for (const row of board) for (const q of row) if (q === c2) n++;
+      return n;
+    };
+    const initial: Record<PieceType, number> = { K: 1, Q: 1, R: 2, B: 2, N: 2, P: 8 };
+    const budget = 8 - countOf('P');
+    let surplus = 0;
+    for (const t of ['Q', 'R', 'B', 'N'] as PieceType[]) surplus += Math.max(0, countOf(t) - initial[t]);
+    if (surplus <= budget) continue;
+    for (const type of ['Q', 'R', 'B', 'N'] as PieceType[]) {
+      while (countOf(type) > initial[type] && surplus > budget) {
+        const code = (white ? type : type.toLowerCase()) as PieceCode;
+        let weakest: { r: number; c: number; alt: PieceType; margin: number } | null = null;
+        for (let r = 0; r < 8; r++) {
+          for (let c = 0; c < 8; c++) {
+            if (board[r][c] !== code) continue;
+            const ts = cells[r][c].typeScores ?? {};
+            let alt: PieceType | null = null;
+            let altScore = -Infinity;
+            for (const [p, sc] of Object.entries(ts)) {
+              if (p === type || p === 'K' || sc === undefined) continue;
+              if (countOf(p as PieceType) >= initial[p as PieceType]) continue;
+              if (sc > altScore) { altScore = sc; alt = p as PieceType; }
+            }
+            if (!alt) continue;
+            const margin = (ts[type] ?? 0) - altScore;
+            if (!weakest || margin < weakest.margin) weakest = { r, c, alt, margin };
+          }
+        }
+        if (!weakest) break;
+        const newCode = (white ? weakest.alt : weakest.alt.toLowerCase()) as PieceCode;
+        board[weakest.r][weakest.c] = newCode;
+        cells[weakest.r][weakest.c].piece = newCode;
+        surplus--;
+      }
+    }
+  }
+
   const avgScore = occupiedCount ? scoreSum / occupiedCount : 0;
   // Map average silhouette score into a friendlier 0..1 confidence.
   const confidence = occupiedCount
@@ -681,4 +783,56 @@ export function classifyBoard(boardImg: RGBAImage, templates?: PieceTemplate[]):
     : 0;
 
   return { board, cells, confidence };
+}
+
+/** King/queen crowns are the most confusable silhouettes. When a second
+ *  recognizer (the CNN, even when it reports itself unreliable overall) has
+ *  an opinion on a K/Q cell whose silhouette scores are nearly tied, adopt
+ *  it. Only swaps within the same color and only between K and Q. */
+export function reconcileKingQueen(rec: RecognitionResult, other: BoardMatrix, maxDeficit = 0.1): number {
+  let changed = 0;
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const mine = rec.board[r][c];
+      const theirs = other[r][c];
+      if (!mine || !theirs) continue;
+      const myType = mine.toUpperCase();
+      const theirType = theirs.toUpperCase();
+      if (myType === theirType) continue;
+      if (!((myType === 'K' && theirType === 'Q') || (myType === 'Q' && theirType === 'K'))) continue;
+      const ts = rec.cells[r][c].typeScores;
+      if (!ts || ts.K === undefined || ts.Q === undefined) continue;
+      if (Math.abs(ts.K - ts.Q) > maxDeficit) continue;
+      const white = mine === mine.toUpperCase();
+      const code = (white ? theirType : theirType.toLowerCase()) as PieceCode;
+      rec.board[r][c] = code;
+      rec.cells[r][c].piece = code;
+      changed++;
+    }
+  }
+  // Never leave a color with two kings: when the other recognizer elected a
+  // king, demote any remaining king of that color to its best non-king type.
+  for (const kingCode of ['K', 'k'] as PieceCode[]) {
+    const kings: { r: number; c: number; elected: boolean }[] = [];
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        if (rec.board[r][c] === kingCode) kings.push({ r, c, elected: other[r][c] === kingCode });
+      }
+    }
+    if (kings.length < 2 || !kings.some((k) => k.elected)) continue;
+    for (const k of kings) {
+      if (k.elected) continue;
+      const ts = rec.cells[k.r][k.c].typeScores ?? {};
+      let alt: PieceType = 'Q';
+      let altScore = -Infinity;
+      for (const [p, sc] of Object.entries(ts)) {
+        if (p !== 'K' && sc !== undefined && sc > altScore) { altScore = sc; alt = p as PieceType; }
+      }
+      const code = (kingCode === 'K' ? alt : alt.toLowerCase()) as PieceCode;
+      rec.board[k.r][k.c] = code;
+      rec.cells[k.r][k.c].piece = code;
+      changed++;
+    }
+  }
+  return changed;
 }

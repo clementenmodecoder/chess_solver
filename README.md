@@ -39,7 +39,7 @@ Panel controls:
 | ⇅ | Flip the detected orientation |
 | FEN | Copy the current FEN to the clipboard |
 | ⛶ | Manually select the board region (fallback when detection fails) |
-| ⚙ | Open settings (engine depth/time, number of lines, watch mode) |
+| ⚙ | Open settings (engine depth/time, number of lines, strength cap, watch mode) |
 
 ## How it works
 
@@ -75,8 +75,11 @@ toolbar click (activeTab)
        │    └─ piece color: tiny logistic model over normalized fill/outline/
        │        texture features, trained offline (scripts/train-color.mjs)
        ├─ coherence: exactly one king per color (K/Q crown confusions fixed
-       │   both ways), implausible piece counts demoted, pawn back-rank and
-       │   material sanity checks
+       │   both ways, the CNN's read breaks silhouette ties), per-board
+       │   relative color clustering (themed sets where both armies share a
+       │   hue), promotion budget (no extra queen while 8 pawns remain),
+       │   implausible piece counts demoted, pawn back-rank and material
+       │   sanity checks
        ├─ orientation: army placement + pawn-rank impossibilities
        ├─ FEN: conservative castling inference, side-to-move toggle in UI
        └─ engine: Stockfish 19 Lite (single-thread WASM, ~1.8 MB) in a Web
@@ -98,10 +101,26 @@ Minimal by design — no host permissions, nothing runs until you click:
 - `offscreen` – host the engine worker (MV3 service workers can't)
 - `storage` – persist settings
 
+## Testing on a real site
+
+Only ever test on **https://www.chess.com/play/computer** (a game against a
+bot) or on puzzle/analysis pages, never in a game against a human: that is
+what the live-game guard is for, and it is also chess.com's fair-play rule.
+
+```bash
+npm run test:smoke   # headless Chromium + test build on chess.com/play/computer
+```
+
+The smoke test injects the extension on the bot-game page, checks that the
+start position is recognized exactly and analyzed, then plays 1.e4 and checks
+that watch mode follows the move and infers "Black to move". Screenshots are
+written to `dist-test/smoke/`. A real crop of chess.com's themed board is kept
+in `tests/real/` as a unit-test fixture.
+
 ## Development
 
 ```bash
-npm test            # unit + recognition suite (36 tests, 43 synthetic fixtures)
+npm test            # unit + recognition suite (43 tests, 43 synthetic fixtures + real crops)
 npm run test:e2e    # real-Chromium end-to-end test (Playwright)
 npm run typecheck
 npm run build       # → dist/
@@ -126,6 +145,7 @@ Debug helpers:
 ```bash
 node scripts/debug-vision.mjs <fixture-substr> cells   # per-cell mismatches
 node scripts/debug-cell.mjs <fixture-substr> <r> <c>   # one cell's silhouette
+node scripts/debug-screenshot.mjs <png> [x,y,w,h]      # real screenshot: detection + colors
 ```
 
 ## Limitations
@@ -142,6 +162,10 @@ node scripts/debug-cell.mjs <fixture-substr> <r> <c>   # one cell's silhouette
 - The board must be fully visible in the viewport when scanning.
 - Single-threaded "lite" engine build (still far stronger than humans); the
   full/multi-threaded builds are larger and need cross-origin isolation.
+- Exotic piece sets (e.g. chess.com's seasonal themes) are read by the
+  classical recognizer with the CNN as tiebreaker; a 1 px grid error can
+  still swap look-alike crowns on such sets. Use ⟳ or ⛶ when the panel
+  warns about low confidence.
 
 ## License
 

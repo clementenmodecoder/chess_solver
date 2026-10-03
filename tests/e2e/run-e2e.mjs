@@ -89,7 +89,7 @@ const base = `http://127.0.0.1:${port}`;
 
 // --- Browser with extension ---------------------------------------------------
 const context = await chromium.launchPersistentContext('', {
-  executablePath: process.env.CHROMIUM_PATH ?? '/opt/pw-browsers/chromium',
+  executablePath: process.env.CHROMIUM_PATH ?? chromium.executablePath(),
   headless: true,
   args: [
     `--disable-extensions-except=${distTest}`,

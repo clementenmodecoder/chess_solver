@@ -2,3 +2,4 @@ node_modules/
 dist/
 tests/fixtures/
 dist-test/
+.dev-build-id

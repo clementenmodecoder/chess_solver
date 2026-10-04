@@ -20,12 +20,109 @@ chrome.action.onClicked.addListener(async (tab) => {
   try {
     // Ping an existing content script; inject if absent.
     await chrome.tabs.sendMessage(tab.id, { type: 'toggle-overlay' });
+    devRememberTab(tab.id, false);
   } catch {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       files: ['content.js'],
     });
+    devRememberTab(tab.id, true);
   }
+});
+
+// --- Dev auto-reload --------------------------------------------------------
+// A dev build (scripts/build.mjs --dev) ships dev.json with a build id and a
+// version URL on the developer's machine. The worker polls that URL; when
+// the id changes, the files on disk have already been replaced, so the
+// extension reloads itself and re-injects the overlay into the tabs where it
+// was active. Absent in release builds (dev.json missing => no-op).
+interface DevConfig {
+  buildId: string;
+  versionUrl: string;
+}
+let devConfig: DevConfig | null | undefined;
+
+async function loadDevConfig(): Promise<DevConfig | null> {
+  if (devConfig !== undefined) return devConfig;
+  try {
+    const res = await fetch(chrome.runtime.getURL('dev.json'));
+    devConfig = res.ok ? ((await res.json()) as DevConfig) : null;
+  } catch {
+    devConfig = null;
+  }
+  return devConfig;
+}
+
+function devRememberTab(tabId: number, active: boolean): void {
+  loadDevConfig().then((cfg) => {
+    if (!cfg) return;
+    chrome.storage.local.get('devActiveTabs').then((stored) => {
+      const tabs = new Set<number>((stored.devActiveTabs as number[] | undefined) ?? []);
+      // A toggle flips the state: remember only tabs that end up active.
+      if (active) tabs.add(tabId);
+      else if (tabs.has(tabId)) tabs.delete(tabId);
+      else tabs.add(tabId);
+      chrome.storage.local.set({ devActiveTabs: [...tabs] });
+    });
+  });
+}
+
+async function devPoll(): Promise<void> {
+  const cfg = await loadDevConfig();
+  if (!cfg) return;
+  try {
+    const res = await fetch(`${cfg.versionUrl}?t=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const remote = (await res.text()).trim();
+    if (remote && remote !== cfg.buildId) {
+      await chrome.storage.local.set({ devReinject: true });
+      chrome.runtime.reload();
+    }
+  } catch {
+    /* dev server unreachable: try again later */
+  }
+}
+
+async function devReinjectAfterReload(): Promise<void> {
+  const cfg = await loadDevConfig();
+  if (!cfg) return;
+  const stored = await chrome.storage.local.get(['devReinject', 'devActiveTabs']);
+  if (!stored.devReinject) return;
+  await chrome.storage.local.set({ devReinject: false });
+  for (const tabId of (stored.devActiveTabs as number[] | undefined) ?? []) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    } catch {
+      /* tab gone */
+    }
+  }
+}
+
+loadDevConfig().then((cfg) => {
+  if (!cfg) return;
+  devReinjectAfterReload();
+  setInterval(devPoll, 3000);
+  // Alarms keep the poll alive across worker suspensions (dev builds only
+  // declare the permission; release/test builds have no chrome.alarms).
+  chrome.alarms?.create('dev-poll', { periodInMinutes: 0.5 });
+});
+// Dev builds: a remembered tab that navigates/reloads gets the overlay back
+// without another toolbar click.
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (info.status !== 'complete' || !tab.url || !/^https?:/.test(tab.url)) return;
+  loadDevConfig().then(async (cfg) => {
+    if (!cfg) return;
+    const stored = await chrome.storage.local.get('devActiveTabs');
+    if (!((stored.devActiveTabs as number[] | undefined) ?? []).includes(tabId)) return;
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'ping' });
+    } catch {
+      chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
+    }
+  });
+});
+chrome.alarms?.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'dev-poll') devPoll();
 });
 
 // Per-service-worker-lifetime creation lock: concurrent callers (analyze +
@@ -126,6 +223,52 @@ chrome.runtime.onMessage.addListener(
         return true;
       }
 
+      case 'vision-scan': {
+        // Capture here (needs the tab's window), then hand the frame and the
+        // page's geometry to the offscreen host, which does all pixel work.
+        const windowId = sender.tab?.windowId;
+        const t0 = Date.now();
+        const withTimeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> =>
+          Promise.race([
+            p,
+            new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms)),
+          ]);
+        let captureMs = 0;
+        Promise.all([
+          withTimeout(
+            chrome.tabs.captureVisibleTab(windowId ?? chrome.windows.WINDOW_ID_CURRENT, { format: 'png' }),
+            8000,
+            'screen capture',
+          ).then((dataUrl) => {
+            captureMs = Date.now() - t0;
+            return dataUrl;
+          }),
+          withTimeout(ensureOffscreen(), 8000, 'engine host startup'),
+        ])
+          .then(([dataUrl]) =>
+            withTimeout(
+              chrome.runtime.sendMessage({
+                type: 'offscreen-vision-scan',
+                dataUrl,
+                request: message.request,
+              } satisfies BackgroundToOffscreen),
+              20000,
+              'board recognition',
+            ),
+          )
+          .then((result) => sendResponse({ ...(result ?? { ok: false, error: 'no response from the engine host' }), captureMs, totalMs: Date.now() - t0 }))
+          .catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err), captureMs, totalMs: Date.now() - t0 }));
+        return true;
+      }
+
+      case 'engine-diag': {
+        ensureOffscreen()
+          .then(() => chrome.runtime.sendMessage({ type: 'offscreen-engine-diag' } satisfies BackgroundToOffscreen))
+          .then((diag) => sendResponse(diag))
+          .catch((err) => sendResponse({ error: String(err?.message ?? err) }));
+        return true;
+      }
+
       case 'stop-analysis': {
         ensureOffscreen()
           .then(() => chrome.runtime.sendMessage({ type: 'engine-stop' } satisfies BackgroundToOffscreen))
@@ -145,6 +288,11 @@ chrome.runtime.onMessage.addListener(
 
       case 'open-options': {
         chrome.runtime.openOptionsPage();
+        return;
+      }
+
+      case 'open-review': {
+        chrome.tabs.create({ url: chrome.runtime.getURL('review.html') });
         return;
       }
 

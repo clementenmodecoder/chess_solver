@@ -10,7 +10,7 @@
 import { chromium } from 'playwright';
 import { resolve } from 'node:path';
 import { mkdirSync } from 'node:fs';
-const distTest = resolve(import.meta.dirname, '../../dist-test');
+const distTest = process.env.CHESS_LENS_DIST ? resolve(process.env.CHESS_LENS_DIST) : resolve(import.meta.dirname, '../../dist-test');
 const out = resolve(distTest, 'smoke');
 mkdirSync(out, { recursive: true });
 const context = await chromium.launchPersistentContext('', {

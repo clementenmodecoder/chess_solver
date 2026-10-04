@@ -148,9 +148,9 @@ try {
       fen === 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
       `start position FEN recognized in-browser (got: ${fen})`,
     );
-    await waitDebug(page, (dbg) => (dbg?.depth ?? 0) >= 12, 60000);
+    await waitDebug(page, (dbg) => (dbg?.depth ?? 0) >= 14 && !!dbg.bestMove, 60000);
     const dbg = await readDebug(page);
-    check(dbg.depth >= 12, `engine reached depth ${dbg.depth}`);
+    check(dbg.depth >= 14, `engine reached depth ${dbg.depth}`);
     check(/^[+-]?\d|^-?M/.test(dbg.scoreText), `score displayed (${dbg.scoreText})`);
     check(!!dbg.bestMove, `best move displayed (${dbg.bestMove})`);
     check(await page.evaluate(() => !!document.getElementById('chess-lens-host')), 'overlay mounted');
@@ -313,6 +313,53 @@ try {
     const dbg = await readDebug(page);
     check(dbg.status === 'blocked', `running clocks block analysis (status: ${dbg.status})`);
     check(dbg.fen === null, 'no FEN produced on blocked page');
+    await page.close();
+  }
+  // ---- Scenario 5: rapid successive analyses must not crash the engine ------
+  // Real pages produce a new position every second or two while the engine
+  // is still searching; the single-threaded WASM build dies on an unserialized
+  // position/go. Drive the engine host directly through the service worker.
+  {
+    const fens = [
+      'rnbqkb1r/ppp1pp1Q/5n1p/3p4/3P4/8/PPP1PPPP/RN2KBNR b KQkq - 0 1',
+      'rnbqkb2/ppp1pp1r/5n1p/3p4/3P4/8/PPP1PPPP/RN2KBNR w KQq - 0 1',
+      'rnbqkb2/ppp1pp1r/5n1p/3p4/3P4/8/PPP1PPPP/RN2KBNR b KQq - 0 1',
+      'rn1qkb2/ppp1pp1r/5n1p/3p1b2/3P4/4P3/PPP2PPP/RN2KBNR w KQq - 0 1',
+      'rn1qkb2/pp2pp1r/2p2n1p/3p1b2/3P4/4PN2/PPP2PPP/RN2KB1R w KQq - 0 1',
+      'r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 1',
+    ];
+    const page = await context.newPage();
+    await page.goto(`${base}/board?img=cburnett-start-brown-256.png&size=512`);
+    await page.bringToFront();
+    await inject(page);
+    await waitDebug(page, (dbg) => dbg?.fen != null, 30000);
+    // Fire analyses 150 ms apart from the service worker (same path as the
+    // content script), then expect the last one to complete.
+    const result = await sw.evaluate(async (fens) => {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tabId = tabs[0].id;
+      const updates = [];
+      const listener = (m) => { if (m.type === 'engine-update') updates.push(m.update); };
+      chrome.runtime.onMessage.addListener(listener);
+      let id = 1000;
+      for (const fen of fens) {
+        await chrome.runtime.sendMessage({ type: 'engine-analyze', fen, options: { depth: 20, movetimeMs: 6000, multiPv: 3, elo: 0 }, requestId: ++id, tabId });
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      const lastId = id;
+      const t0 = Date.now();
+      let done = null;
+      while (Date.now() - t0 < 20000) {
+        done = updates.find((u) => u.requestId === lastId && u.done);
+        if (done) break;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      chrome.runtime.onMessage.removeListener(listener);
+      const diag = await chrome.runtime.sendMessage({ type: 'offscreen-engine-diag' });
+      return { done: !!done, error: done?.error, depth: done?.lines?.[0]?.depth, crashed: diag.log.some((l) => /worker error|engine reset/.test(l)) };
+    }, fens);
+    check(result.done && !result.error, `rapid successive analyses: last one completes (depth ${result.depth}, error ${result.error ?? 'none'})`);
+    check(!result.crashed, 'engine never crashed during rapid analyses');
     await page.close();
   }
 } catch (err) {

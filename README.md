@@ -40,6 +40,7 @@ Panel controls:
 | FEN | Copy the current FEN to the clipboard |
 | ⛶ | Manually select the board region (fallback when detection fails) |
 | ⚙ | Open settings (engine depth/time, number of lines, strength cap, watch mode) |
+| Review | Open the Game Review page (PGN → full report) |
 
 ## How it works
 
@@ -100,6 +101,25 @@ Minimal by design — no host permissions, nothing runs until you click:
 - `scripting` – inject the content script on click
 - `offscreen` – host the engine worker (MV3 service workers can't)
 - `storage` – persist settings
+
+## Game Review (PGN)
+
+Click **Review** in the panel (or open `review.html` from the extension) and
+paste a PGN or open a `.pgn` file. The page evaluates every position with
+Stockfish (MultiPV 2, three speed presets) and produces a chess.com-style
+report: accuracy per player, every move classified (Brilliant, Great, Best,
+Excellent, Good, Book, Inaccuracy, Mistake, Miss, Blunder), the evaluation
+graph, key moments, and a navigable board that shows the move that should
+have been played on every mistake. All local; a 70-ply game takes ~17 s in
+Fast mode, ~1 min in Normal.
+
+The scale follows the win-probability model used by lichess and chess.com:
+`win% = 50 + 50·(2/(1+e^(-0.00368·cp)) − 1)`; a move's accuracy is
+`103.17·e^(−0.04354·drop) − 3.17`; classes are by win% drop (Best ≤ 0.5,
+Excellent < 2, Good < 5, Inaccuracy < 10, Mistake < 20, Blunder ≥ 20),
+Great = the only move that holds, Brilliant = a sound sacrifice that is best,
+Miss = failing to cash in the opponent's previous error. Book = a compact
+embedded table of mainstream opening lines.
 
 ## Testing on a real site
 

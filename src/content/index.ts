@@ -3,30 +3,23 @@
  *  the toolbar action (activeTab), never automatically. */
 
 import { Chess } from 'chess.js';
-import type { RGBAImage, Rect } from '../vision/types';
-import { detectBoard, snapGrid } from '../vision/detect';
-import { classifyBoard, reconcileKingQueen } from '../vision/classify';
-import { loadTemplates } from '../vision/templates';
-import { harvestIntoStore, learnedToTemplates, HARVEST_MIN_CONFIDENCE, type LearnedStore } from '../vision/learning';
-import { crop } from '../vision/image';
-import {
-  buildFen,
-  decideOrientation,
-  orientMatrix,
-  placementFromMatrix,
-  placementToMatrix,
-  validatePosition,
-} from '../chess/fen';
+import { buildFen, placementToMatrix } from '../chess/fen';
 import { formatScore, scoreToBarFraction, type UciInfoLine } from '../engine/uci';
-import type { BackgroundToContent, CaptureResponse, EngineUpdate, Settings, VisionResult } from '../messages';
+import type { BackgroundToContent, EngineUpdate, ScanMessage, ScanResponse, Settings } from '../messages';
+import type { LearnedStore } from '../vision/learning';
 import { DEFAULT_SETTINGS } from '../messages';
 import { Overlay, type CssRect } from './overlay';
 import { detectPlayContext } from './safety';
 import { inferSideFromHistory } from '../chess/transition';
 
+// Build token: after a dev auto-reload the orphaned script of the previous
+// build still holds the old flag, so the guard compares tokens, not booleans.
+declare const __CHESS_LENS_BUILD__: string;
+const BUILD_TOKEN = typeof __CHESS_LENS_BUILD__ === 'string' ? __CHESS_LENS_BUILD__ : 'release';
+
 declare global {
   interface Window {
-    __chessLensActive?: boolean;
+    __chessLensActive?: string;
     /** Debug/E2E hook: latest recognition + engine state. */
     __chessLensDebug?: {
       fen: string | null;
@@ -44,6 +37,10 @@ declare global {
       cnnMinConfidence?: number;
       cnnPlacement?: string;
       boardRect?: { x: number; y: number; w: number; h: number } | null;
+      build?: string;
+      timings?: Record<string, number>;
+      /** In-page step marks of the current scan (ms since scan start). */
+      marks?: Record<string, number>;
       /** How many times the overlay was hidden for a capture (flicker probe). */
       hideCount?: number;
       scanCount?: number;
@@ -54,6 +51,7 @@ declare global {
 function updateDebug(partial: Partial<NonNullable<Window['__chessLensDebug']>>): void {
   if (!window.__chessLensDebug) {
     window.__chessLensDebug = {
+      build: BUILD_TOKEN,
       fen: null,
       status: 'boot',
       depth: 0,
@@ -72,6 +70,15 @@ function updateDebug(partial: Partial<NonNullable<Window['__chessLensDebug']>>):
   } catch {
     /* ignore */
   }
+}
+
+/** Depth below which the best move is not shown yet. */
+const MIN_TRUSTED_DEPTH = 14;
+
+let scanStartedAt = 0;
+function mark(name: string): void {
+  const marks = { ...(window.__chessLensDebug?.marks ?? {}), [name]: Math.round(performance.now() - scanStartedAt) };
+  updateDebug({ marks });
 }
 
 interface BoardSource {
@@ -106,11 +113,13 @@ class ChessLens {
   private lastSafeAt = 0;
   private learned: LearnedStore = {};
   private learnedLoaded = false;
-  private lastBoardHash: number | null = null;
+  /** Hash of the last arrow-inclusive probe capture of the board region. */
+  private lastProbeHash: number | null = null;
   private unchangedStreak = 0;
   private scanQueued = false;
   private lastScanAt = 0;
   private repositionRaf = 0;
+  private engineRetried = false;
 
   constructor() {
     this.overlay = new Overlay({
@@ -135,6 +144,7 @@ class ChessLens {
       },
       onSelectRegion: () => this.selectRegion(),
       onOpenOptions: () => chrome.runtime.sendMessage({ type: 'open-options' }),
+      onOpenReview: () => chrome.runtime.sendMessage({ type: 'open-review' }),
       onClose: () => this.destroy(),
     });
 
@@ -160,6 +170,21 @@ class ChessLens {
       const cmd = (e as CustomEvent).detail;
       if (cmd === 'rescan') this.scan(true);
       else if (cmd === 'select-region') this.selectRegion();
+      else if (cmd === 'engine-diag') {
+        chrome.runtime
+          .sendMessage({ type: 'engine-diag' })
+          .then((diag) => {
+            document.documentElement.dataset.chessLensEngineDiag = JSON.stringify({
+              ...diag,
+              currentRequestId: this.currentRequestId,
+              lastFen: this.lastFen,
+              settings: this.settings,
+            });
+          })
+          .catch((err) => {
+            document.documentElement.dataset.chessLensEngineDiag = JSON.stringify({ error: String(err?.message ?? err) });
+          });
+      }
     };
     document.addEventListener('chess-lens-debug', this.debugListener);
 
@@ -198,71 +223,44 @@ class ChessLens {
     this.overlay.destroy();
   }
 
-  // --- Capture ---------------------------------------------------------------
+  // --- Capture + offscreen scan ---------------------------------------------
 
-  private async captureViewport(): Promise<{ img: RGBAImage; sx: number; sy: number; dataUrl: string } | null> {
+  /** Ask the service worker to capture the tab and the offscreen host to
+   *  run the vision pipeline on it. No pixel work happens in the page. */
+  private async runScan(req: Omit<ScanMessage, 'viewport' | 'learned'>, forRecognition: boolean): Promise<ScanResponse> {
+    if (forRecognition) await this.ensureLearnedLoaded();
     // Hide the overlay ONLY when it could contaminate the board pixels
-    // (unknown board rect yet, or actual overlap). Hiding on every automatic
-    // re-scan makes the whole UI flicker.
-    const mustHide = !this.source.cssRect || this.overlay.overlapsRect(this.source.cssRect);
+    // (unknown board rect yet, or actual overlap). The best-move arrow sits
+    // on the board: hide it before a recognition capture (one-frame blink);
+    // a probe capture keeps it (static between scans, so the change hash is
+    // unaffected).
+    const mustHide = forRecognition && (!this.source.cssRect || this.overlay.overlapsRect(this.source.cssRect));
     if (mustHide) updateDebug({ hideCount: (window.__chessLensDebug?.hideCount ?? 0) + 1 });
-    // The arrow always sits on the board: hide it for every capture (a
-    // one-frame blink) or the recognizer reads it back as pieces.
-    this.overlay.setArrowHidden(true);
+    if (forRecognition) this.overlay.setArrowHidden(true);
     if (mustHide) this.overlay.setHidden(true);
-    // Two rAFs get us past the next paint, plus a short real delay so the
-    // compositor actually submits the arrow-less frame before the capture
-    // (captureVisibleTab can otherwise return the previous composited frame).
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    await new Promise((r) => setTimeout(r, 60));
-    let resp: CaptureResponse;
-    try {
-      resp = await chrome.runtime.sendMessage({ type: 'capture' });
-    } finally {
-      this.overlay.setArrowHidden(false);
-      if (mustHide) this.overlay.setHidden(false);
+    if (forRecognition) {
+      // Two rAFs get us past the next paint, plus a short real delay so the
+      // compositor actually submits the arrow-less frame before the capture.
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await new Promise((r) => setTimeout(r, 60));
     }
-    if (!resp?.ok || !resp.dataUrl) {
-      this.overlay.setStatus('error', `Screen capture failed: ${resp?.error ?? 'unknown error'}`);
-      return null;
-    }
-    const blob = await (await fetch(resp.dataUrl)).blob();
-    const bitmap = await createImageBitmap(blob);
-    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-    ctx.drawImage(bitmap, 0, 0);
-    const data = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-    bitmap.close();
-    const vw = window.visualViewport?.width ?? window.innerWidth;
-    const vh = window.visualViewport?.height ?? window.innerHeight;
-    return {
-      img: { data: data.data, width: data.width, height: data.height },
-      sx: data.width / vw,
-      sy: data.height / vh,
-      dataUrl: resp.dataUrl,
+    const message: ScanMessage = {
+      ...req,
+      viewport: { w: window.visualViewport?.width ?? window.innerWidth, h: window.visualViewport?.height ?? window.innerHeight },
+      learned: forRecognition ? this.learned : {},
     };
-  }
-
-  private async imageToDataUrl(img: RGBAImage): Promise<string> {
-    const canvas = new OffscreenCanvas(img.width, img.height);
-    const ctx = canvas.getContext('2d')!;
-    ctx.putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
-    const blob = await canvas.convertToBlob({ type: 'image/png' });
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(blob);
-    });
-  }
-
-  /** Ask the offscreen CNN recognizer (fenshot) to read a board image. */
-  private async cnnRecognize(dataUrl: string, exactBoard: boolean): Promise<VisionResult | null> {
     try {
-      const result: VisionResult = await chrome.runtime.sendMessage({ type: 'vision-recognize', dataUrl, exactBoard });
-      return result?.ok ? result : null;
-    } catch {
-      return null;
+      const resp: ScanResponse | undefined = await chrome.runtime.sendMessage({ type: 'vision-scan', request: message });
+      if (resp?.learned) {
+        this.learned = resp.learned;
+        chrome.storage.local.set({ [this.learnedKey()]: this.learned }).catch(() => {});
+      }
+      return resp ?? { ok: false, error: 'no response from the extension' };
+    } catch (err) {
+      return { ok: false, error: String((err as Error)?.message ?? err) };
+    } finally {
+      if (forRecognition) this.overlay.setArrowHidden(false);
+      if (mustHide) this.overlay.setHidden(false);
     }
   }
 
@@ -334,6 +332,9 @@ class ChessLens {
   }
 
   private async doScan(userInitiated: boolean): Promise<void> {
+    scanStartedAt = performance.now();
+    updateDebug({ marks: {} });
+    mark('start');
     if (userInitiated) this.overlay.setStatus('detecting', 'Scanning…');
 
     // Cache the "safe" verdict briefly so watch-mode rescans don't pay the
@@ -343,6 +344,7 @@ class ChessLens {
       context = await detectPlayContext();
       if (context === 'safe') this.lastSafeAt = Date.now();
     }
+    mark('context');
     if (context === 'live-play') {
       this.blocked = true;
       this.stopWatching();
@@ -356,74 +358,88 @@ class ChessLens {
     }
 
     this.blocked = false;
-    updateDebug({ scanCount: (window.__chessLensDebug?.scanCount ?? 0) + 1 });
-    const captured = await this.captureViewport();
-    if (!captured) return;
-    const { img, sx, sy } = captured;
-
-    let rect: Rect | null = null;
-    let candidates: { el: Element; rect: DOMRect }[] = [];
-    if (this.source.manualRect) {
-      // The user drew this region: trust it. Only snap the grid sub-pixel;
-      // never re-run detection that could reject or replace it.
-      const m = this.source.manualRect;
-      rect = snapGrid(img, { x: m.x * sx, y: m.y * sy, w: m.w * sx, h: m.h * sy });
-    } else {
-      const hints: Rect[] = [];
-      if (this.source.element?.isConnected) {
-        const r = this.source.element.getBoundingClientRect();
-        hints.push({ x: r.left * sx, y: r.top * sy, w: r.width * sx, h: r.height * sy });
-      }
-      candidates = this.collectDomCandidates();
-      for (const c of candidates) {
-        hints.push({ x: c.rect.left * sx, y: c.rect.top * sy, w: c.rect.width * sx, h: c.rect.height * sy });
-      }
-      rect = detectBoard(img, hints)?.rect ?? null;
+    // A hidden tab cannot be captured (and its timers are throttled): wait
+    // for it to come back instead of piling up failing scans.
+    if (document.visibilityState === 'hidden') {
+      updateDebug({ status: 'hidden' });
+      this.overlay.setStatus('paused', 'Tab not visible — analysis resumes when you come back.');
+      const onVisible = () => {
+        if (document.visibilityState !== 'visible') return;
+        document.removeEventListener('visibilitychange', onVisible);
+        if (!this.destroyed && !this.paused) this.scan(true);
+      };
+      document.addEventListener('visibilitychange', onVisible);
+      return;
     }
+    updateDebug({ scanCount: (window.__chessLensDebug?.scanCount ?? 0) + 1 });
 
-    // Cheap change gate for watch mode: when the board pixels have not
-    // changed since the last scan, stop here (no recognizer, no UI churn).
-    if (rect) {
-      const hash = sampleHash(img, rect);
-      if (!userInitiated && hash === this.lastBoardHash) {
+    // Watch-mode fast path: with a known board rect, a probe capture hashed
+    // in the offscreen host decides whether anything changed before any
+    // detection or recognition work (pages like chess.com mutate their DOM
+    // constantly without the position changing).
+    if (!userInitiated && this.source.cssRect && !this.source.manualRect) {
+      const probe = await this.runScan(
+        { hints: [], manualRect: null, orientationFlipped: this.orientationFlipped, probeRect: this.source.cssRect, lastHash: this.lastProbeHash },
+        false,
+      );
+      if (probe.ok && probe.unchanged) {
         this.unchangedStreak++;
         this.startWatching();
         return;
       }
-      this.lastBoardHash = hash;
-    }
-
-    // --- Primary recognizer: the fenshot CNN (offscreen, onnxruntime-web).
-    // Trained across ~72 piece sets and ~55 board themes; reads any theme.
-    // When our geometric detector found the board we send it the crop,
-    // otherwise the whole viewport (fenshot has its own detector).
-    let screenMatrix: ReturnType<typeof placementToMatrix> | null = null;
-    let confidence = 0;
-    let recognizerUsed: 'cnn' | 'classic' = 'cnn';
-    const vision = await this.cnnRecognize(
-      rect ? await this.imageToDataUrl(crop(img, rect)) : captured.dataUrl,
-      rect !== null,
-    );
-    updateDebug({ cnnReliable: vision?.reliable ?? false, cnnMinConfidence: vision?.minConfidence, cnnPlacement: vision?.placement });
-    if (vision?.reliable && vision.placement) {
-      try {
-        // fenshot reads as if White were at the bottom of the image; its
-        // rank-8..1 placement therefore maps directly to screen rows.
-        screenMatrix = placementToMatrix(vision.placement);
-        confidence = vision.minConfidence ?? 0.7;
-        if (!rect && vision.corners) {
-          rect = {
-            x: vision.corners.x0,
-            y: vision.corners.y0,
-            w: vision.corners.x1 - vision.corners.x0,
-            h: vision.corners.y1 - vision.corners.y0,
-          };
-        }
-      } catch {
-        screenMatrix = null;
+      // Something changed: let the board settle (move animations take
+      // ~200 ms) and only recognize once two consecutive probes agree, or
+      // a piece in flight gets read on the wrong square.
+      let hash = probe.ok ? probe.hash : undefined;
+      for (let i = 0; i < 4; i++) {
+        await new Promise((r) => setTimeout(r, 280));
+        const again = await this.runScan(
+          { hints: [], manualRect: null, orientationFlipped: this.orientationFlipped, probeRect: this.source.cssRect, lastHash: hash ?? null },
+          false,
+        );
+        if (!again.ok) break;
+        if (again.unchanged) break;
+        hash = again.hash;
       }
+      if (hash !== undefined) this.lastProbeHash = hash;
     }
 
+    mark('probe');
+    const hints: CssRect[] = [];
+    let candidates: { el: Element; rect: DOMRect }[] = [];
+    if (!this.source.manualRect) {
+      if (this.source.element?.isConnected) {
+        const r = this.source.element.getBoundingClientRect();
+        hints.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+      candidates = this.collectDomCandidates();
+      for (const c of candidates) hints.push({ x: c.rect.left, y: c.rect.top, w: c.rect.width, h: c.rect.height });
+    }
+    mark('candidates');
+    const result = await this.runScan(
+      { hints, manualRect: this.source.manualRect, orientationFlipped: this.orientationFlipped, probeRect: null, lastHash: null },
+      true,
+    );
+    mark('scan-response');
+    if (!result.ok) {
+      updateDebug({ status: 'error', error: result.error ?? 'scan failed', timings: { capture: result.captureMs ?? -1, total: result.totalMs ?? -1 } });
+      this.overlay.setStatus('error', `Scan failed: ${result.error ?? 'unknown error'}`);
+      // Transient (capture timeout, host restarting): retry shortly.
+      setTimeout(() => !this.destroyed && this.scan(false), 2000);
+      return;
+    }
+    updateDebug({
+      cnnReliable: result.cnn?.reliable ?? false,
+      cnnMinConfidence: result.cnn?.minConfidence,
+      cnnPlacement: result.cnn?.placement,
+      recognizer: result.recognizer,
+      rawPlacement: result.rawPlacement ?? undefined,
+      boardRect: result.rect ?? null,
+      timings: { ...(result.timings ?? {}), capture: result.captureMs ?? -1, total: result.totalMs ?? -1 },
+    });
+    if (result.hash !== undefined) this.lastProbeHash = result.hash;
+
+    const rect = result.rect ?? null;
     if (!rect) {
       updateDebug({ status: 'no-board' });
       this.overlay.setBoardRect(null);
@@ -438,46 +454,17 @@ class ChessLens {
     // and change watching.
     this.source.element = null;
     for (const c of candidates) {
-      const hx = c.rect.left * sx, hy = c.rect.top * sy, hw = c.rect.width * sx;
-      if (Math.abs(hx - rect.x) < hw * 0.1 && Math.abs(hy - rect.y) < hw * 0.1 && Math.abs(hw - rect.w) < hw * 0.12) {
+      if (Math.abs(c.rect.left - rect.x) < rect.w * 0.1 && Math.abs(c.rect.top - rect.y) < rect.w * 0.1 && Math.abs(c.rect.width - rect.w) < rect.w * 0.12) {
         this.source.element = c.el;
         break;
       }
     }
-    this.source.cssRect = { x: rect.x / sx, y: rect.y / sy, w: rect.w / sx, h: rect.h / sy };
-
-    // --- Fallback recognizer: classic silhouette matching against bundled
-    // templates plus silhouettes learned from previous validated scans on
-    // this site (works fully offline of any model, and keeps improving).
-    let classicRec: ReturnType<typeof classifyBoard> | null = null;
-    if (!screenMatrix) {
-      recognizerUsed = 'classic';
-      await this.ensureLearnedLoaded();
-      const boardImg = crop(img, rect);
-      const templates = [...loadTemplates(), ...learnedToTemplates(this.learned)];
-      classicRec = classifyBoard(boardImg, templates);
-      // The CNN's read, even when unreliable overall, is a good tiebreaker
-      // for the K/Q crown confusion of silhouette matching.
-      if (vision?.placement) {
-        try {
-          reconcileKingQueen(classicRec, placementToMatrix(vision.placement));
-        } catch {
-          /* malformed CNN placement: ignore */
-        }
-      }
-      screenMatrix = classicRec.board;
-      confidence = classicRec.confidence;
-    }
-
-    updateDebug({ recognizer: recognizerUsed, rawPlacement: placementFromMatrix(screenMatrix), boardRect: rect });
-    const auto = decideOrientation(screenMatrix);
-    this.whiteAtBottom = this.orientationFlipped ? !auto.whiteAtBottom : auto.whiteAtBottom;
-    const oriented = orientMatrix(screenMatrix, this.whiteAtBottom);
-    const validation = validatePosition(oriented);
-
+    this.source.cssRect = rect;
+    this.whiteAtBottom = result.whiteAtBottom ?? true;
     this.overlay.setBoardRect(this.source.cssRect, this.whiteAtBottom);
 
-    if (!validation.ok) {
+    const validation = result.validation ?? { ok: false, errors: ['unknown'], warnings: [] };
+    if (!validation.ok || !result.placement) {
       updateDebug({ status: 'invalid', error: validation.errors.join('; ') });
       this.overlay.setStatus(
         'error',
@@ -486,20 +473,14 @@ class ChessLens {
       this.startWatching();
       return;
     }
+    const oriented = placementToMatrix(result.placement);
+    const notes: string[] = [];
+    if (result.lowConfidence) notes.push('Low recognition confidence — verify the position.');
+    if (validation.warnings.length) notes.push(validation.warnings.join('; '));
 
-    // A validated classic read: harvest this theme's silhouettes so the
-    // fallback keeps adapting to the site.
-    if (classicRec && classicRec.confidence >= HARVEST_MIN_CONFIDENCE && harvestIntoStore(this.learned, classicRec)) {
-      this.saveLearned();
-    }
-    updateDebug({ recognizer: recognizerUsed });
 
     const fen = buildFen(oriented, this.sideToMove);
     const placementSide = fen.split(' ').slice(0, 2).join(' ');
-    const notes: string[] = [];
-    const lowConfidence = recognizerUsed === 'cnn' ? confidence < 0.8 : confidence < 0.45;
-    if (lowConfidence) notes.push('Low recognition confidence — verify the position.');
-    if (validation.warnings.length) notes.push(validation.warnings.join('; '));
 
     if (placementSide === this.lastPlacementSide && !userInitiated) {
       // Position unchanged: keep current analysis running.
@@ -529,7 +510,9 @@ class ChessLens {
 
     this.overlay.setBestMoveArrow(null, this.whiteAtBottom);
     this.overlay.setStatus('analyzing', notes.length ? notes.join(' ') : undefined);
+    mark('ui');
     await this.requestAnalysis(this.lastFen);
+    mark('analysis-requested');
     this.startWatching();
   }
 
@@ -572,16 +555,26 @@ class ChessLens {
     if (update.error) {
       updateDebug({ error: update.error });
       this.overlay.setStatus('error', `Engine: ${update.error}`);
+      // A crashed engine is rebuilt on the next request: retry once.
+      if (/crashed/i.test(update.error) && this.lastFen && !this.engineRetried) {
+        this.engineRetried = true;
+        setTimeout(() => this.lastFen && this.requestAnalysis(this.lastFen), 500);
+      }
       return;
     }
+    this.engineRetried = false;
     if (!update.lines.length) return;
     const main = update.lines[0];
     const chess = this.lastFen ? tryChess(this.lastFen) : null;
     const bestSan = chess && main.pv.length ? sanLine(chess, main.pv.slice(0, 1)) : main.pv[0] ?? '';
+    // Shallow searches change their mind every few plies: only commit to a
+    // "best move" (text + arrow) once the search is deep enough to trust.
+    const trusted = update.done || main.depth >= MIN_TRUSTED_DEPTH;
     const view = {
       barFraction: scoreToBarFraction(main.score),
       scoreText: formatScore(main.score),
-      bestMove: bestSan,
+      bestMove: trusted ? bestSan : '',
+      thinking: !trusted,
       depth: main.depth,
       nps: main.nps,
       engineName: update.engineName,
@@ -591,11 +584,11 @@ class ChessLens {
       })),
     };
     this.overlay.setEval(view);
-    this.overlay.setBestMoveArrow(main.pv[0] ?? null, this.whiteAtBottom);
+    this.overlay.setBestMoveArrow(trusted ? (main.pv[0] ?? null) : null, this.whiteAtBottom);
     updateDebug({
       depth: main.depth,
       scoreText: view.scoreText,
-      bestMove: view.bestMove ?? '',
+      bestMove: trusted ? (view.bestMove ?? '') : '',
       engineDone: update.done,
     });
     if (update.done) {
@@ -682,10 +675,6 @@ class ChessLens {
     }
   }
 
-  private saveLearned(): void {
-    chrome.storage.local.set({ [this.learnedKey()]: this.learned }).catch(() => {});
-  }
-
   // --- Manual region selection ----------------------------------------------
 
   private async selectRegion(): Promise<void> {
@@ -705,27 +694,6 @@ class ChessLens {
     // Refine the manual rect with whatever the detector settled on.
     if (this.source.cssRect) this.source.manualRect = this.source.cssRect;
   }
-}
-
-/** Cheap content hash of a board region: sampled pixel sums. */
-function sampleHash(img: RGBAImage, rect: { x: number; y: number; w: number; h: number }): number {
-  const x0 = Math.max(0, Math.round(rect.x));
-  const y0 = Math.max(0, Math.round(rect.y));
-  const x1 = Math.min(img.width, Math.round(rect.x + rect.w));
-  const y1 = Math.min(img.height, Math.round(rect.y + rect.h));
-  let h = 2166136261 >>> 0;
-  const stepY = Math.max(1, Math.floor((y1 - y0) / 64));
-  const stepX = Math.max(1, Math.floor((x1 - x0) / 64));
-  for (let y = y0; y < y1; y += stepY) {
-    for (let x = x0; x < x1; x += stepX) {
-      const i = (y * img.width + x) * 4;
-      h = (h ^ img.data[i]) >>> 0;
-      h = Math.imul(h, 16777619) >>> 0;
-      h = (h ^ img.data[i + 1]) >>> 0;
-      h = Math.imul(h, 16777619) >>> 0;
-    }
-  }
-  return h;
 }
 
 function tryChess(fen: string): Chess | null {
@@ -762,8 +730,18 @@ function sanLine(base: Chess, uciMoves: string[]): string {
 // (the content script file stays loaded after destroy).
 let instance: ChessLens | null = null;
 
-if (!window.__chessLensActive) {
-  window.__chessLensActive = true;
+if (window.__chessLensActive !== BUILD_TOKEN) {
+  window.__chessLensActive = BUILD_TOKEN;
+  // Evict any instance of a previous build still running in this tab (an
+  // extension reload orphans its content scripts; they keep their timers).
+  document.dispatchEvent(new CustomEvent('chess-lens-teardown', { detail: BUILD_TOKEN }));
+  document.getElementById('chess-lens-host')?.remove();
+  document.addEventListener('chess-lens-teardown', (e) => {
+    if ((e as CustomEvent).detail === BUILD_TOKEN) return;
+    if (instance && !instance.isDestroyed) instance.destroy();
+    instance = null;
+    window.__chessLensActive = undefined;
+  });
   chrome.runtime.onMessage.addListener((message: BackgroundToContent) => {
     if (message.type !== 'toggle-overlay') return;
     if (instance && !instance.isDestroyed) {

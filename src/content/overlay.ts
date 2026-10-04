@@ -18,6 +18,8 @@ export interface EvalView {
   barFraction: number; // 0..1 share for White (bottom by default)
   scoreText: string;
   bestMove?: string;
+  /** Search not deep enough yet to commit to a best move. */
+  thinking?: boolean;
   depth?: number;
   nps?: number;
   engineName?: string;
@@ -34,6 +36,7 @@ export interface OverlayCallbacks {
   onSideChange(side: 'w' | 'b'): void;
   onSelectRegion(): void;
   onOpenOptions(): void;
+  onOpenReview(): void;
   onClose(): void;
 }
 
@@ -92,6 +95,7 @@ const CSS = `
 .headline .eval { font-size: 26px; font-weight: 800; letter-spacing: -.5px; }
 .headline .best { font-size: 15px; font-weight: 600; color: #9ecf8f; }
 .headline .best .lbl { font-size: 10px; font-weight: 500; color: #8f8a82; margin-right: 5px; }
+.headline .best .lbl.thinking { color: #c8b37a; animation: pulse 1.2s infinite; }
 
 .pvs { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
 .pv { display: flex; gap: 8px; align-items: baseline; background: rgba(255,255,255,.045); border-radius: 8px; padding: 4px 8px; }
@@ -149,6 +153,7 @@ export class Overlay {
   constructor(cb: OverlayCallbacks) {
     this.cb = cb;
     this.host = document.createElement('div');
+    this.host.id = 'chess-lens-host';
     this.host.id = 'chess-lens-host';
     const shadow = this.host.attachShadow({ mode: 'closed' });
     const style = document.createElement('style');
@@ -208,12 +213,14 @@ export class Overlay {
         <button class="btn" id="btn-flip" title="Flip detected orientation">⇅</button>
         <button class="btn" id="btn-fen" title="Copy FEN">FEN</button>
         <button class="btn" id="btn-region" title="Select board region manually">⛶</button>
+        <button class="btn" id="btn-review" title="Review a PGN game (full game report)">Review</button>
       </div>`;
     this.root.appendChild(this.panel);
 
     for (const el of this.panel.querySelectorAll<HTMLElement>('[id]')) this.els[el.id] = el;
     this.els['btn-close'].addEventListener('click', () => this.cb.onClose());
     this.els['btn-options'].addEventListener('click', () => this.cb.onOpenOptions());
+    this.els['btn-review'].addEventListener('click', () => this.cb.onOpenReview());
     this.els['btn-rescan'].addEventListener('click', () => this.cb.onRescan());
     this.els['btn-fen'].addEventListener('click', () => this.cb.onCopyFen());
     this.els['btn-flip'].addEventListener('click', () => this.cb.onFlip());
@@ -398,7 +405,9 @@ export class Overlay {
     this.els['eval'].textContent = view.scoreText;
     this.els['best'].innerHTML = view.bestMove
       ? `<span class="lbl">BEST</span>${escapeHtml(view.bestMove)}`
-      : '';
+      : view.thinking
+        ? `<span class="lbl thinking">thinking… depth ${view.depth ?? 0}</span>`
+        : '';
     const pvs = this.els['pvs'];
     pvs.innerHTML = '';
     for (const line of view.lines) {
